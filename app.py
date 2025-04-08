@@ -10,6 +10,7 @@ import uuid
 from flask import Flask, request, jsonify, send_file, make_response
 from functools import wraps, lru_cache
 import threading
+import urllib.parse
 
 app = Flask(__name__)
 
@@ -19,6 +20,7 @@ UPLOAD_DIR = os.path.join(CURRENT_DIR, "downloads/")
 OUTPUT_DIR = os.path.join(CURRENT_DIR, "mp3/")
 CACHE_EXPIRY = 86400  # 24 hours (in seconds)
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB max file size
+MAX_RETRIES = 3  # Maximum number of retries for API requests
 
 # Create directories if they don't exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -237,6 +239,171 @@ def fetch_from_ssstik(url):
         log_message(f'Error using SSSTik service: {str(e)}')
         return None
 
+# NEW: Try to get TikTok video using SnaptikAPI
+def fetch_from_snaptik(url):
+    log_message(f'Trying Snaptik API service for: {url}')
+    
+    api_url = 'https://snaptik.app/abc2.php'
+    encoded_url = urllib.parse.quote(url)
+    
+    try:
+        session = requests.Session()
+        # First get the token
+        response = session.get(
+            'https://snaptik.app/en',
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            },
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            log_message('Failed to access Snaptik service')
+            return None
+        
+        # Extract token
+        token_match = re.search(r'var\s+token\s*=\s*"([^"]+)"', response.text)
+        if not token_match:
+            log_message('Failed to extract token from Snaptik')
+            return None
+        
+        token = token_match.group(1)
+        
+        # Make API request
+        response = session.post(
+            api_url,
+            data={
+                'url': encoded_url,
+                'token': token
+            },
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'Origin': 'https://snaptik.app',
+                'Referer': 'https://snaptik.app/en',
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            log_message(f'Failed to get a response from Snaptik API: {response.status_code}')
+            return None
+        
+        response_text = response.text
+        
+        # Parse response HTML to find download links
+        video_match = re.search(r'href="(https://[^"]+\.mp4[^"]*)"', response_text)
+        if not video_match:
+            log_message('Failed to extract download link from Snaptik response')
+            return None
+        
+        video_url = video_match.group(1).replace('&amp;', '&')
+        
+        # Try to extract author
+        author = 'Unknown'
+        author_match = re.search(r'<h2[^>]*>@([^<]+)</h2>', response_text)
+        if author_match:
+            author = author_match.group(1)
+        
+        # Try to extract description
+        desc = ''
+        desc_match = re.search(r'<p[^>]*class="[^"]*text[^"]*"[^>]*>([^<]+)</p>', response_text)
+        if desc_match:
+            desc = desc_match.group(1)
+            
+        return {
+            'video_url': video_url,
+            'author': author,
+            'desc': desc,
+            'video_id': hashlib.md5(url.encode()).hexdigest(),
+            'cover_url': '',
+            'likes': 0,
+            'comments': 0,
+            'shares': 0,
+            'plays': 0,
+            'method': 'snaptik'
+        }
+    except Exception as e:
+        log_message(f'Error using Snaptik service: {str(e)}')
+        return None
+
+# NEW: Direct approach for TikTok URLs
+def fetch_direct_tiktok(url):
+    log_message(f'Trying direct extraction for: {url}')
+    
+    try:
+        # Make sure we're working with the full URL after any redirects
+        if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
+            url = follow_tiktok_redirects(url)
+        
+        # Request the TikTok page with mobile user agent
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://www.tiktok.com/',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache',
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code != 200:
+            log_message(f'Failed to access TikTok page: {response.status_code}')
+            return None
+        
+        html_content = response.text
+        
+        # Look for video URLs in the HTML content
+        # Try to find mp4 URL
+        video_url_match = re.search(r'(https://v[^"\']+\.mp4[^"\']*)["\']\s*,', html_content)
+        if not video_url_match:
+            video_url_match = re.search(r'"(https://v[^"\']+\.mp4[^"\']*)"', html_content)
+        
+        if not video_url_match:
+            log_message('Could not find video URL in TikTok page')
+            return None
+            
+        video_url = video_url_match.group(1).replace('\\u002F', '/').replace('\\', '')
+        
+        # Try to extract the author username
+        author = 'TikToker'
+        author_match = re.search(r'"uniqueId"\s*:\s*"([^"]+)"', html_content)
+        if author_match:
+            author = author_match.group(1)
+        
+        # Try to extract the video description
+        desc = ''
+        desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', html_content)
+        if desc_match:
+            desc = desc_match.group(1).replace('\\n', ' ').replace('\\', '')
+        
+        return {
+            'video_url': video_url,
+            'author': author,
+            'desc': desc,
+            'video_id': hashlib.md5(url.encode()).hexdigest(),
+            'cover_url': '',
+            'likes': 0,
+            'comments': 0,
+            'shares': 0,
+            'plays': 0,
+            'method': 'direct'
+        }
+    except Exception as e:
+        log_message(f'Error with direct TikTok extraction: {str(e)}')
+        return None
+
 # Functions for MP3 conversion
 def sanitize_filename(name):
     """Remove any path info and sanitize the file name"""
@@ -310,13 +477,23 @@ def download_tiktok_video(url):
     if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url or len(url.split('/')[2]) < 15:
         url = follow_tiktok_redirects(url)
     
-    # Try to get video info
-    result = fetch_from_tikwm(url)
-    if not result:
-        result = fetch_from_ssstik(url)
+    # Try multiple methods to get video info
+    result = None
+    methods = [
+        fetch_from_tikwm,
+        fetch_from_ssstik,
+        fetch_from_snaptik,  # Added new method
+        fetch_direct_tiktok  # Added direct extraction as last resort
+    ]
+    
+    for method in methods:
+        result = method(url)
+        if result and result.get('video_url'):
+            log_message(f"Successfully extracted video using {result['method']} method")
+            break
     
     if not result or not result.get('video_url'):
-        raise Exception("Failed to extract video URL from TikTok link")
+        raise Exception("Failed to extract video URL from TikTok link - tried all available methods")
     
     video_url = result['video_url']
     author = result['author']
@@ -325,17 +502,57 @@ def download_tiktok_video(url):
     filename = f"{sanitize_filename(author)}_{uuid.uuid4().hex[:8]}.mp4"
     file_path = os.path.join(UPLOAD_DIR, filename)
     
-    # Download the video
+    # Download the video with retry mechanism
     log_message(f"Downloading video from {video_url} to {file_path}")
-    response = requests.get(video_url, stream=True, timeout=30)
     
-    if response.status_code != 200:
-        raise Exception(f"Failed to download video: HTTP {response.status_code}")
-    
-    with open(file_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
+    for attempt in range(MAX_RETRIES):
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Referer': 'https://www.tiktok.com/',
+                'Accept': '*/*',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive'
+            }
+            
+            response = requests.get(video_url, stream=True, timeout=30, headers=headers)
+            
+            if response.status_code != 200:
+                log_message(f"Attempt {attempt+1} failed with status {response.status_code}")
+                if attempt == MAX_RETRIES - 1:
+                    raise Exception(f"Failed to download video after {MAX_RETRIES} attempts: HTTP {response.status_code}")
+                time.sleep(1)  # Wait before retrying
+                continue
+            
+            # Check if we're getting HTML instead of video data
+            content_type = response.headers.get('Content-Type', '')
+            if 'text/html' in content_type or response.text.strip().startswith('<!DOCTYPE html>'):
+                log_message(f"Received HTML instead of video data on attempt {attempt+1}")
+                if attempt == MAX_RETRIES - 1:
+                    raise Exception("Received HTML instead of video data")
+                time.sleep(1)  # Wait before retrying
+                continue
+                
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            # Verify file exists and has a reasonable size
+            if not os.path.exists(file_path) or os.path.getsize(file_path) < 1024:
+                log_message(f"Downloaded file is too small or doesn't exist on attempt {attempt+1}")
+                if attempt == MAX_RETRIES - 1:
+                    raise Exception("Downloaded file is too small or doesn't exist")
+                time.sleep(1)  # Wait before retrying
+                continue
+                
+            break  # Successful download
+            
+        except Exception as e:
+            log_message(f"Download attempt {attempt+1} failed: {str(e)}")
+            if attempt == MAX_RETRIES - 1:
+                raise Exception(f"Failed to download video after {MAX_RETRIES} attempts: {str(e)}")
+            time.sleep(1)  # Wait before retrying
     
     return {
         'file_path': file_path,
@@ -365,6 +582,7 @@ def convert_to_mp3(video_path, author, desc):
         "-metadata", f"title={desc[:30]}",  # Set title metadata (truncated to 30 chars)
         "-threads", "0",  # Use all available threads
         "-preset", "fast",  # Use faster preset
+        "-y",  # Overwrite output file if it exists
         output_path
     ]
     
@@ -514,58 +732,77 @@ def clear_cache():
                     if os.path.exists(data["output_path"]):
                         os.remove(data["output_path"])
                 except Exception as e:
-                    log_message(f"Error removing file: {str(e)}")
+                    logger.error(f"Error removing file {data['output_path']}: {str(e)}")
             
             file_cache = {}
         
-        return jsonify({'success': True, 'message': 'All caches cleared successfully'})
+        return jsonify({'success': True, 'message': 'All caches cleared'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# Example command line usage
-def tiktok_to_mp3_cli(tiktok_url, output_path=None):
-    """Command line function to download a TikTok video and convert it to MP3"""
+@app.route('/status', methods=['GET'])
+def status_check():
+    """More detailed status endpoint for monitoring"""
     try:
-        print(f"Downloading TikTok video: {tiktok_url}")
-        video_info = download_tiktok_video(tiktok_url)
-        video_path = video_info['file_path']
+        with cache_lock:
+            video_cache_count = len(video_cache)
+            file_cache_count = len(file_cache)
         
-        print(f"Converting to MP3...")
-        mp3_path = convert_to_mp3(video_path, video_info['author'], video_info['desc'])
+        # Check if directories exist and are writable
+        upload_dir_status = os.path.exists(UPLOAD_DIR) and os.access(UPLOAD_DIR, os.W_OK)
+        output_dir_status = os.path.exists(OUTPUT_DIR) and os.access(OUTPUT_DIR, os.W_OK)
         
-        # If output path is specified, copy the file there
-        if output_path:
-            if not os.path.isdir(output_path):
-                os.makedirs(output_path, exist_ok=True)
-            
-            import shutil
-            dest_path = os.path.join(output_path, os.path.basename(mp3_path))
-            shutil.copy2(mp3_path, dest_path)
-            mp3_path = dest_path
+        # Check if FFmpeg is available
+        ffmpeg_status = "available"
+        try:
+            get_ffmpeg_version()
+        except Exception:
+            ffmpeg_status = "not available"
         
-        print(f"\nSuccess! MP3 saved to: {mp3_path}")
-        return mp3_path
-    
+        return jsonify({
+            'status': 'ok',
+            'timestamp': time.time(),
+            'video_cache': {
+                'count': video_cache_count,
+                'expiry_seconds': CACHE_EXPIRY
+            },
+            'file_cache': {
+                'count': file_cache_count,
+                'expiry_seconds': CACHE_EXPIRY
+            },
+            'directories': {
+                'upload': upload_dir_status,
+                'output': output_dir_status
+            },
+            'ffmpeg': ffmpeg_status
+        })
     except Exception as e:
-        print(f"Error: {str(e)}")
-        return None
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'success': False, 'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({'success': False, 'error': 'Internal server error occurred'}), 500
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({'success': False, 'error': 'Method not allowed'}), 405
 
 if __name__ == '__main__':
-    import sys
+    # Start background cleanup thread
+    start_cleanup_thread()
     
-    # If run directly, check if command line arguments are provided
-    if len(sys.argv) > 1:
-        url = sys.argv[1]
-        output_dir = sys.argv[2] if len(sys.argv) > 2 else None
-        tiktok_to_mp3_cli(url, output_dir)
-    else:
-        # Start the cleanup thread
-        start_cleanup_thread()
-        logger.info("Started cache cleanup thread")
-        
-        # Start the Flask app
-        print("Starting TikTok to MP3 Converter API...")
-        print("Usage examples:")
-        print("  - API: POST to /api/tiktok-to-mp3 with JSON payload {\"url\": \"https://www.tiktok.com/@username/video/1234567890\"}")
-        print("  - CLI: python tiktok_to_mp3.py https://www.tiktok.com/@username/video/1234567890 [output_directory]")
-        app.run(host='0.0.0.0', port=5000, debug=False)
+    # Get port from environment variable or use default 5000
+    port = int(os.environ.get('PORT', 5000))
+    
+    # Log application startup
+    logger.info(f"Starting TikTok to MP3 converter on port {port}")
+    logger.info(f"FFmpeg version: {get_ffmpeg_version()}")
+    logger.info(f"Upload directory: {UPLOAD_DIR}")
+    logger.info(f"Output directory: {OUTPUT_DIR}")
+    
+    # Run the Flask application
+    app.run(host='0.0.0.0', port=port, debug=False)
