@@ -2,4 +2,3 @@ Flask
 gunicorn
 werkzeug
 requests
-flask_cors
