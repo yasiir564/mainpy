@@ -391,20 +391,30 @@ def convert_to_mp3(video_path, author, desc):
     
     return output_path
 
-# CORS middleware
-def cors_middleware(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        response = make_response(f(*args, **kwargs))
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-        return response
-    return decorated_function
+# Apply CORS to all routes
+@app.after_request
+def add_cors_headers(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
+
+# Special handling for OPTIONS requests
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    return '', 200
+
+# Root route handler
+@app.route('/', methods=['GET', 'POST'])
+def root():
+    if request.method == 'POST':
+        # Handle the same way as your tiktok-to-mp3 endpoint
+        return tiktok_to_mp3()
+    return jsonify({'status': 'running', 'message': 'TikTok to MP3 API is running'})
 
 # Routes
 @app.route('/api/tiktok-to-mp3', methods=['POST', 'OPTIONS'])
-@cors_middleware
 def tiktok_to_mp3():
     """Endpoint that takes a TikTok URL and returns an MP3 download link"""
     # Handle CORS preflight request
