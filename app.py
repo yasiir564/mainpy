@@ -8,7 +8,6 @@ import requests
 import subprocess
 import uuid
 from flask import Flask, request, jsonify, send_file
-from functools import wraps, lru_cache
 import threading
 
 app = Flask(__name__)
@@ -84,9 +83,7 @@ def extract_tiktok_id(url):
 # Follow redirects to get final URL
 def follow_tiktok_redirects(url):
     try:
-        response = requests.head(url, allow_redirects=True, 
-                               headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'},
-                               timeout=10)
+        response = requests.head(url, allow_redirects=True, timeout=10)
         final_url = response.url
         log_message(f'Redirect resolved to: {final_url}')
         return final_url
@@ -104,7 +101,6 @@ def fetch_from_tikwm(url):
         response = requests.post(
             api_url,
             data={'url': url, 'hd': 0},  # Lower quality to save resources
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
             timeout=15
         )
         
@@ -130,19 +126,48 @@ def fetch_from_tikwm(url):
         log_message(f'Error using TikWM API: {str(e)}')
         return None
 
+# Secondary method: Use Rapid API (SnapTik)
+def fetch_from_snaptik(url):
+    log_message(f'Trying SnapTik API for: {url}')
+    
+    api_url = "https://snaptik.p.rapidapi.com/video-info"
+    
+    payload = {"url": url}
+    headers = {
+        "content-type": "application/json",
+        "X-RapidAPI-Key": os.environ.get('RAPIDAPI_KEY', ''),
+        "X-RapidAPI-Host": "snaptik.p.rapidapi.com"
+    }
+    
+    if not headers["X-RapidAPI-Key"]:
+        log_message('No RapidAPI key found, skipping SnapTik')
+        return None
+    
+    try:
+        response = requests.post(api_url, json=payload, headers=headers, timeout=15)
+        data = response.json()
+        
+        if response.status_code != 200 or not data.get('url'):
+            log_message(f'SnapTik API request failed: {data}')
+            return None
+        
+        return {
+            'video_url': data['url'],
+            'author': data.get('username', 'tiktok_user'),
+            'video_id': hashlib.md5(url.encode()).hexdigest()[:16],
+            'method': 'snaptik'
+        }
+    except Exception as e:
+        log_message(f'Error using SnapTik API: {str(e)}')
+        return None
+
 # Simple fallback method - direct player URL extraction
 def fetch_direct_url(url):
     log_message(f'Trying direct extraction for: {url}')
     
     try:
         # Try to get the page content
-        response = requests.get(
-            url,
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            },
-            timeout=15
-        )
+        response = requests.get(url, timeout=15)
         
         if response.status_code != 200:
             return None
@@ -231,15 +256,17 @@ def download_tiktok_video(url):
     if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
         url = follow_tiktok_redirects(url)
     
-    # Try primary method first
+    # Try all methods in sequence
     result = fetch_from_tikwm(url)
     
-    # If primary fails, try fallback method
+    if not result or not result.get('video_url'):
+        result = fetch_from_snaptik(url)
+        
     if not result or not result.get('video_url'):
         result = fetch_direct_url(url)
     
     if not result or not result.get('video_url'):
-        raise Exception("Failed to extract video URL from TikTok link")
+        raise Exception("Failed to extract video URL from TikTok link. This may be due to TikTok's anti-scraping measures.")
     
     video_url = result['video_url']
     author = result['author']
@@ -250,8 +277,7 @@ def download_tiktok_video(url):
     
     # Download the video with limited buffer size
     try:
-        response = requests.get(video_url, stream=True, timeout=20, 
-                              headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        response = requests.get(video_url, stream=True, timeout=20)
         
         if response.status_code != 200:
             raise Exception(f"Failed to download video: HTTP {response.status_code}")
@@ -429,8 +455,18 @@ def tiktok_to_mp3():
         return jsonify(result)
     
     except Exception as e:
-        logger.error(f"Error processing TikTok to MP3: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        error_message = str(e)
+        logger.error(f"Error processing TikTok to MP3: {error_message}")
+        
+        # Provide more helpful error messages for common issues
+        if "403" in error_message:
+            error_message = "Access denied by TikTok (HTTP 403). The video may be private or TikTok may be blocking our request."
+        
+        return jsonify({
+            'success': False, 
+            'error': error_message,
+            'url': tiktok_url
+        }), 500
 
 @app.route('/download/<filename>', methods=['GET'])
 def download_file(filename):
