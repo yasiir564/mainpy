@@ -7,7 +7,7 @@ import hashlib
 import requests
 import subprocess
 import uuid
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, request, jsonify, send_file
 from functools import wraps, lru_cache
 import threading
 
@@ -17,16 +17,16 @@ app = Flask(__name__)
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(CURRENT_DIR, "downloads/")
 OUTPUT_DIR = os.path.join(CURRENT_DIR, "mp3/")
-CACHE_EXPIRY = 86400  # 24 hours (in seconds)
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB max file size
+CACHE_EXPIRY = 3600  # 1 hour (in seconds) - reduced from 24 hours
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB max file size - reduced from 500MB
 
 # Create directories if they don't exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging - reduced logging to save resources
+logging.basicConfig(level=logging.WARNING,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('tiktok_to_mp3')
 
 # Cache storage
@@ -44,7 +44,6 @@ def log_message(message):
 # Cache functions for TikTok videos
 def get_tiktok_cache(url_hash):
     if url_hash in video_cache and video_cache[url_hash]['expires'] > time.time():
-        log_message(f'Cache hit for TikTok: {url_hash}')
         return video_cache[url_hash]['data']
     return False
 
@@ -53,7 +52,6 @@ def set_tiktok_cache(url_hash, data, expiration=CACHE_EXPIRY):
         'data': data,
         'expires': time.time() + expiration
     }
-    log_message(f'Cache set for TikTok: {url_hash}')
     return True
 
 # Extract TikTok video ID from URL
@@ -85,156 +83,44 @@ def extract_tiktok_id(url):
 
 # Follow redirects to get final URL
 def follow_tiktok_redirects(url):
-    log_message(f'Following redirects for: {url}')
-    
     try:
         response = requests.head(url, allow_redirects=True, 
                                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'},
-                               timeout=10)
-        final_url = response.url
-        log_message(f'Redirect resolved to: {final_url}')
-        return final_url
+                               timeout=5)  # Reduced timeout
+        return response.url
     except Exception as e:
-        log_message(f'Error following redirect: {str(e)}')
+        logger.warning(f'Error following redirect: {str(e)}')
         return url
 
-# Try to get TikTok video using TikWM API
+# Only use TikWM API - no fallbacks to save resources
 def fetch_from_tikwm(url):
-    log_message(f'Trying TikWM API service for: {url}')
-    
     api_url = 'https://www.tikwm.com/api/'
     
     try:
         response = requests.post(
             api_url,
-            data={
-                'url': url,
-                'hd': 1
-            },
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            },
-            timeout=30
+            data={'url': url, 'hd': 0},  # Set to 0 for lower quality video to save resources
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+            timeout=10  # Reduced timeout
         )
         
         if response.status_code != 200:
-            log_message(f'Error: TikWM API request failed with status: {response.status_code}')
             return None
         
         data = response.json()
         
         if not data.get('data') or data.get('code') != 0:
-            log_message(f'TikWM API returned error: {data}')
             return None
         
         video_data = data['data']
         
         return {
             'video_url': video_data['play'],
-            'cover_url': video_data['cover'],
             'author': video_data['author']['unique_id'],
-            'desc': video_data['title'],
-            'video_id': video_data['id'],
-            'likes': video_data.get('digg_count', 0),
-            'comments': video_data.get('comment_count', 0),
-            'shares': video_data.get('share_count', 0),
-            'plays': video_data.get('play_count', 0),
-            'method': 'tikwm'
+            'video_id': video_data['id']
         }
     except Exception as e:
-        log_message(f'Error using TikWM API: {str(e)}')
-        return None
-
-# Try to get TikTok video using SSSTik API
-def fetch_from_ssstik(url):
-    log_message(f'Trying SSSTik API service for: {url}')
-    
-    session = requests.Session()
-    
-    try:
-        # First request to get cookies and token
-        response = session.get(
-            'https://ssstik.io/en',
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            },
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            log_message('Failed to access SSSTik service')
-            return None
-        
-        html = response.text
-        
-        # Extract the tt token
-        tt_match = re.search(r'name="tt"[\s]+value="([^"]+)"', html)
-        if not tt_match:
-            log_message('Failed to extract token from SSSTik')
-            return None
-        
-        tt_token = tt_match.group(1)
-        
-        # Make the API request
-        response = session.post(
-            'https://ssstik.io/abc?url=dl',
-            data={
-                'id': url,
-                'locale': 'en',
-                'tt': tt_token
-            },
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'Origin': 'https://ssstik.io',
-                'Referer': 'https://ssstik.io/en',
-                'X-Requested-With': 'XMLHttpRequest'
-            },
-            timeout=30
-        )
-        
-        if response.status_code != 200:
-            log_message('Failed to get a response from SSSTik API')
-            return None
-        
-        response_text = response.text
-        
-        # Parse the HTML response to extract the download link
-        video_match = re.search(r'<a href="([^"]+)"[^>]+>Download server 1', response_text)
-        if not video_match:
-            log_message('Failed to extract download link from SSSTik response')
-            return None
-        
-        video_url = video_match.group(1).replace('&amp;', '&')
-        
-        # Extract username if available
-        author = 'Unknown'
-        user_match = re.search(r'<div class="maintext">@([^<]+)</div>', response_text)
-        if user_match:
-            author = user_match.group(1)
-        
-        # Extract description/title if available
-        desc = ''
-        desc_match = re.search(r'<p[^>]+class="maintext">([^<]+)</p>', response_text)
-        if desc_match:
-            desc = desc_match.group(1)
-        
-        return {
-            'video_url': video_url,
-            'author': author,
-            'desc': desc,
-            'video_id': hashlib.md5(url.encode()).hexdigest(),
-            'cover_url': '',
-            'likes': 0,
-            'comments': 0,
-            'shares': 0,
-            'plays': 0,
-            'method': 'ssstik'
-        }
-    except Exception as e:
-        log_message(f'Error using SSSTik service: {str(e)}')
+        logger.warning(f'Error using TikWM API: {str(e)}')
         return None
 
 # Functions for MP3 conversion
@@ -248,34 +134,15 @@ def sanitize_filename(name):
 def generate_unique_filename(original_name):
     """Generate a unique filename based on the original name"""
     filename, extension = os.path.splitext(original_name)
-    unique_id = uuid.uuid4().hex[:10]
+    unique_id = uuid.uuid4().hex[:6]  # Shortened the unique ID
     return f"{sanitize_filename(filename)}_{unique_id}{extension}"
-
-@lru_cache(maxsize=10)
-def get_ffmpeg_version():
-    """Cache the FFmpeg version to avoid repeated subprocess calls"""
-    try:
-        process = subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
-        return process.stdout.split('\n')[0]
-    except Exception as e:
-        return f"FFmpeg version check failed: {str(e)}"
 
 def cleanup_expired_files():
     """Remove files that haven't been accessed for CACHE_EXPIRY seconds"""
     current_time = time.time()
     with cache_lock:
         # Clean video cache
-        expired_keys = []
-        for key, data in video_cache.items():
-            if current_time > data["expires"]:
-                expired_keys.append(key)
-        
+        expired_keys = [key for key, data in video_cache.items() if current_time > data["expires"]]
         for key in expired_keys:
             del video_cache[key]
         
@@ -286,7 +153,6 @@ def cleanup_expired_files():
                 try:
                     if os.path.exists(data["output_path"]):
                         os.remove(data["output_path"])
-                        logger.info(f"Removed expired file: {data['output_path']}")
                     expired_keys.append(key)
                 except Exception as e:
                     logger.error(f"Error removing file {data['output_path']}: {str(e)}")
@@ -299,7 +165,7 @@ def start_cleanup_thread():
     def cleanup_task():
         while True:
             cleanup_expired_files()
-            time.sleep(300)  # Run every 5 minutes
+            time.sleep(600)  # Run every 10 minutes instead of 5
 
     cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
     cleanup_thread.start()
@@ -310,10 +176,8 @@ def download_tiktok_video(url):
     if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url or len(url.split('/')[2]) < 15:
         url = follow_tiktok_redirects(url)
     
-    # Try to get video info
+    # Get video info using only TikWM method
     result = fetch_from_tikwm(url)
-    if not result:
-        result = fetch_from_ssstik(url)
     
     if not result or not result.get('video_url'):
         raise Exception("Failed to extract video URL from TikTok link")
@@ -321,50 +185,60 @@ def download_tiktok_video(url):
     video_url = result['video_url']
     author = result['author']
     
-    # Generate a nice filename based on the author and a unique ID
-    filename = f"{sanitize_filename(author)}_{uuid.uuid4().hex[:8]}.mp4"
+    # Generate a filename based on the author and a unique ID
+    filename = f"{sanitize_filename(author)}_{uuid.uuid4().hex[:6]}.mp4"
     file_path = os.path.join(UPLOAD_DIR, filename)
     
-    # Download the video
-    log_message(f"Downloading video from {video_url} to {file_path}")
-    response = requests.get(video_url, stream=True, timeout=30)
+    # Download the video with limited buffer size to conserve memory
+    response = requests.get(video_url, stream=True, timeout=15)
     
     if response.status_code != 200:
         raise Exception(f"Failed to download video: HTTP {response.status_code}")
     
+    file_size = 0
     with open(file_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
+        for chunk in response.iter_content(chunk_size=4096):  # Smaller chunks
             if chunk:
+                file_size += len(chunk)
+                if file_size > MAX_FILE_SIZE:
+                    f.close()
+                    os.remove(file_path)
+                    raise Exception("File too large")
                 f.write(chunk)
     
     return {
         'file_path': file_path,
         'author': author,
-        'desc': result['desc'],
         'video_id': result['video_id'],
         'filename': filename
     }
 
-def convert_to_mp3(video_path, author, desc):
-    """Convert video to MP3 and return the MP3 file path"""
+def convert_to_mp3(video_path, author, quality="medium"):
+    """Convert video to MP3 with configurable quality and return the MP3 file path"""
+    # Set bitrate based on quality
+    bitrates = {
+        "low": "64k",
+        "medium": "128k",
+        "high": "192k"
+    }
+    bitrate = bitrates.get(quality, "128k")
+    
     # Generate output filename
     output_filename = f"{os.path.splitext(os.path.basename(video_path))[0]}.mp3"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     
-    # Convert the video to MP3 using FFmpeg
-    log_message(f"Converting {video_path} to MP3: {output_path}")
-    
+    # Convert the video to MP3 using FFmpeg with optimized settings
     ffmpeg_command = [
         "ffmpeg", 
-        "-i", video_path, 
+        "-i", video_path,
         "-vn",  # No video
         "-ar", "44100",  # Audio sample rate
         "-ac", "2",  # Stereo
-        "-b:a", "192k",  # Bitrate
+        "-b:a", bitrate,  # Configurable bitrate
         "-metadata", f"artist={author}",  # Set artist metadata
-        "-metadata", f"title={desc[:30]}",  # Set title metadata (truncated to 30 chars)
-        "-threads", "0",  # Use all available threads
-        "-preset", "fast",  # Use faster preset
+        "-f", "mp3",  # Force MP3 format
+        "-threads", "2",  # Limit threads to save resources
+        "-loglevel", "error",  # Reduce logging
         output_path
     ]
     
@@ -379,15 +253,11 @@ def convert_to_mp3(video_path, author, desc):
     if process.returncode != 0:
         raise Exception(f"FFmpeg conversion failed: {process.stderr}")
     
-    # Check if output file exists
-    if not os.path.exists(output_path):
-        raise Exception("Output file was not created")
-    
-    # Delete the original video file
+    # Delete the original video file immediately to free up space
     try:
         os.remove(video_path)
     except Exception as e:
-        log_message(f"Warning: Could not delete original video file: {str(e)}")
+        logger.warning(f"Could not delete original video file: {str(e)}")
     
     return output_path
 
@@ -409,7 +279,6 @@ def handle_options(path):
 @app.route('/', methods=['GET', 'POST'])
 def root():
     if request.method == 'POST':
-        # Handle the same way as your tiktok-to-mp3 endpoint
         return tiktok_to_mp3()
     return jsonify({'status': 'running', 'message': 'TikTok to MP3 API is running'})
 
@@ -430,7 +299,13 @@ def tiktok_to_mp3():
         return jsonify({'success': False, 'error': 'TikTok URL is required'}), 400
     
     tiktok_url = data['url'].strip()
-    url_hash = hashlib.md5(tiktok_url.encode()).hexdigest()
+    quality = data.get('quality', 'medium')  # Default to medium quality
+    
+    # Validate quality parameter
+    if quality not in ['low', 'medium', 'high']:
+        quality = 'medium'
+        
+    url_hash = hashlib.md5((tiktok_url + quality).encode()).hexdigest()
     
     # Check for cached result
     cached_result = get_tiktok_cache(url_hash)
@@ -443,11 +318,11 @@ def tiktok_to_mp3():
         video_path = video_info['file_path']
         
         # 2. Convert video to MP3
-        mp3_path = convert_to_mp3(video_path, video_info['author'], video_info['desc'])
+        mp3_path = convert_to_mp3(video_path, video_info['author'], quality)
         mp3_filename = os.path.basename(mp3_path)
         
         # 3. Add to cache
-        file_hash = hashlib.md5(tiktok_url.encode()).hexdigest()
+        file_hash = hashlib.md5((tiktok_url + quality).encode()).hexdigest()
         with cache_lock:
             file_cache[file_hash] = {
                 "output_path": mp3_path,
@@ -460,7 +335,7 @@ def tiktok_to_mp3():
             'mp3_url': f"/download/{mp3_filename}",
             'filename': mp3_filename,
             'author': video_info['author'],
-            'title': video_info['desc'],
+            'quality': quality,
             'cached': False
         }
         
@@ -470,7 +345,7 @@ def tiktok_to_mp3():
         return jsonify(result)
     
     except Exception as e:
-        log_message(f"Error processing TikTok to MP3: {str(e)}")
+        logger.warning(f"Error processing TikTok to MP3: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/download/<filename>', methods=['GET'])
@@ -504,7 +379,6 @@ def status():
     
     return jsonify({
         'status': 'running',
-        'ffmpeg_version': get_ffmpeg_version(),
         'video_cache_count': video_cache_count,
         'file_cache_count': file_cache_count,
         'cache_expiry_seconds': CACHE_EXPIRY
@@ -524,7 +398,7 @@ def clear_cache():
                     if os.path.exists(data["output_path"]):
                         os.remove(data["output_path"])
                 except Exception as e:
-                    log_message(f"Error removing file: {str(e)}")
+                    logger.warning(f"Error removing file: {str(e)}")
             
             file_cache = {}
         
@@ -532,50 +406,13 @@ def clear_cache():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# Example command line usage
-def tiktok_to_mp3_cli(tiktok_url, output_path=None):
-    """Command line function to download a TikTok video and convert it to MP3"""
-    try:
-        print(f"Downloading TikTok video: {tiktok_url}")
-        video_info = download_tiktok_video(tiktok_url)
-        video_path = video_info['file_path']
-        
-        print(f"Converting to MP3...")
-        mp3_path = convert_to_mp3(video_path, video_info['author'], video_info['desc'])
-        
-        # If output path is specified, copy the file there
-        if output_path:
-            if not os.path.isdir(output_path):
-                os.makedirs(output_path, exist_ok=True)
-            
-            import shutil
-            dest_path = os.path.join(output_path, os.path.basename(mp3_path))
-            shutil.copy2(mp3_path, dest_path)
-            mp3_path = dest_path
-        
-        print(f"\nSuccess! MP3 saved to: {mp3_path}")
-        return mp3_path
-    
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return None
-
 if __name__ == '__main__':
     import sys
     
-    # If run directly, check if command line arguments are provided
-    if len(sys.argv) > 1:
-        url = sys.argv[1]
-        output_dir = sys.argv[2] if len(sys.argv) > 2 else None
-        tiktok_to_mp3_cli(url, output_dir)
-    else:
-        # Start the cleanup thread
-        start_cleanup_thread()
-        logger.info("Started cache cleanup thread")
-        
-        # Start the Flask app
-        print("Starting TikTok to MP3 Converter API...")
-        print("Usage examples:")
-        print("  - API: POST to /api/tiktok-to-mp3 with JSON payload {\"url\": \"https://www.tiktok.com/@username/video/1234567890\"}")
-        print("  - CLI: python tiktok_to_mp3.py https://www.tiktok.com/@username/video/1234567890 [output_directory]")
-        app.run(host='0.0.0.0', port=5000, debug=False)
+    # Start the cleanup thread
+    start_cleanup_thread()
+    logger.warning("Started cache cleanup thread")
+    
+    # Start the Flask app with minimal settings
+    print("Starting TikTok to MP3 Converter API...")
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False, threaded=True)
