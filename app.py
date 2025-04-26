@@ -17,15 +17,15 @@ app = Flask(__name__)
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(CURRENT_DIR, "downloads/")
 OUTPUT_DIR = os.path.join(CURRENT_DIR, "mp3/")
-CACHE_EXPIRY = 3600  # 1 hour (in seconds) - reduced from 24 hours
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB max file size - reduced from 500MB
+CACHE_EXPIRY = 3600  # 1 hour (in seconds)
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB max file size
 
 # Create directories if they don't exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Configure logging - reduced logging to save resources
-logging.basicConfig(level=logging.WARNING,
+# Configure logging
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('tiktok_to_mp3')
 
@@ -86,41 +86,96 @@ def follow_tiktok_redirects(url):
     try:
         response = requests.head(url, allow_redirects=True, 
                                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'},
-                               timeout=5)  # Reduced timeout
-        return response.url
+                               timeout=10)
+        final_url = response.url
+        log_message(f'Redirect resolved to: {final_url}')
+        return final_url
     except Exception as e:
-        logger.warning(f'Error following redirect: {str(e)}')
+        log_message(f'Error following redirect: {str(e)}')
         return url
 
-# Only use TikWM API - no fallbacks to save resources
+# Primary method: TikWM API
 def fetch_from_tikwm(url):
+    log_message(f'Trying TikWM API for: {url}')
+    
     api_url = 'https://www.tikwm.com/api/'
     
     try:
         response = requests.post(
             api_url,
-            data={'url': url, 'hd': 0},  # Set to 0 for lower quality video to save resources
+            data={'url': url, 'hd': 0},  # Lower quality to save resources
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
-            timeout=10  # Reduced timeout
+            timeout=15
         )
         
         if response.status_code != 200:
+            log_message(f'TikWM API request failed with status: {response.status_code}')
             return None
         
         data = response.json()
         
         if not data.get('data') or data.get('code') != 0:
+            log_message(f'TikWM API returned error: {data}')
             return None
         
         video_data = data['data']
         
         return {
             'video_url': video_data['play'],
-            'author': video_data['author']['unique_id'],
-            'video_id': video_data['id']
+            'author': video_data['author']['unique_id'] if video_data.get('author') else 'tiktok_user',
+            'video_id': video_data['id'],
+            'method': 'tikwm'
         }
     except Exception as e:
-        logger.warning(f'Error using TikWM API: {str(e)}')
+        log_message(f'Error using TikWM API: {str(e)}')
+        return None
+
+# Simple fallback method - direct player URL extraction
+def fetch_direct_url(url):
+    log_message(f'Trying direct extraction for: {url}')
+    
+    try:
+        # Try to get the page content
+        response = requests.get(
+            url,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            },
+            timeout=15
+        )
+        
+        if response.status_code != 200:
+            return None
+            
+        # Look for the video URL in the HTML
+        html_content = response.text
+        
+        # Extract username if available
+        author_match = re.search(r'uniqueId\\":\\"([^"\\]+)', html_content)
+        author = author_match.group(1) if author_match else 'tiktok_user'
+        
+        # Try to find video URL
+        video_url_match = re.search(r'playAddr\\":\\"([^"\\]+)', html_content)
+        if not video_url_match:
+            video_url_match = re.search(r'"playAddr":"([^"]+)', html_content)
+        
+        if not video_url_match:
+            return None
+            
+        video_url = video_url_match.group(1).replace('\\u002F', '/').replace('\\', '')
+        
+        # If URL doesn't start with http, add it
+        if not video_url.startswith('http'):
+            video_url = 'https:' + video_url
+            
+        return {
+            'video_url': video_url,
+            'author': author,
+            'video_id': hashlib.md5(url.encode()).hexdigest()[:16],
+            'method': 'direct'
+        }
+    except Exception as e:
+        log_message(f'Error using direct extraction: {str(e)}')
         return None
 
 # Functions for MP3 conversion
@@ -129,12 +184,12 @@ def sanitize_filename(name):
     name = os.path.basename(name)
     name = name.replace(' ', '_')
     name = re.sub(r'[^A-Za-z0-9_\-\.]', '', name)
-    return name
+    return name[:50]  # Limit filename length
 
 def generate_unique_filename(original_name):
     """Generate a unique filename based on the original name"""
     filename, extension = os.path.splitext(original_name)
-    unique_id = uuid.uuid4().hex[:6]  # Shortened the unique ID
+    unique_id = uuid.uuid4().hex[:6]
     return f"{sanitize_filename(filename)}_{unique_id}{extension}"
 
 def cleanup_expired_files():
@@ -165,7 +220,7 @@ def start_cleanup_thread():
     def cleanup_task():
         while True:
             cleanup_expired_files()
-            time.sleep(600)  # Run every 10 minutes instead of 5
+            time.sleep(600)  # Run every 10 minutes
 
     cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
     cleanup_thread.start()
@@ -173,11 +228,15 @@ def start_cleanup_thread():
 def download_tiktok_video(url):
     """Download a TikTok video and return the local file path"""
     # Normalize URL for short links
-    if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url or len(url.split('/')[2]) < 15:
+    if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
         url = follow_tiktok_redirects(url)
     
-    # Get video info using only TikWM method
+    # Try primary method first
     result = fetch_from_tikwm(url)
+    
+    # If primary fails, try fallback method
+    if not result or not result.get('video_url'):
+        result = fetch_direct_url(url)
     
     if not result or not result.get('video_url'):
         raise Exception("Failed to extract video URL from TikTok link")
@@ -189,22 +248,29 @@ def download_tiktok_video(url):
     filename = f"{sanitize_filename(author)}_{uuid.uuid4().hex[:6]}.mp4"
     file_path = os.path.join(UPLOAD_DIR, filename)
     
-    # Download the video with limited buffer size to conserve memory
-    response = requests.get(video_url, stream=True, timeout=15)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to download video: HTTP {response.status_code}")
-    
-    file_size = 0
-    with open(file_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=4096):  # Smaller chunks
-            if chunk:
-                file_size += len(chunk)
-                if file_size > MAX_FILE_SIZE:
-                    f.close()
-                    os.remove(file_path)
-                    raise Exception("File too large")
-                f.write(chunk)
+    # Download the video with limited buffer size
+    try:
+        response = requests.get(video_url, stream=True, timeout=20, 
+                              headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+        
+        if response.status_code != 200:
+            raise Exception(f"Failed to download video: HTTP {response.status_code}")
+        
+        file_size = 0
+        with open(file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=4096):
+                if chunk:
+                    file_size += len(chunk)
+                    if file_size > MAX_FILE_SIZE:
+                        f.close()
+                        os.remove(file_path)
+                        raise Exception("File too large")
+                    f.write(chunk)
+    except Exception as e:
+        # Clean up file if download fails
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise Exception(f"Download failed: {str(e)}")
     
     return {
         'file_path': file_path,
@@ -227,37 +293,55 @@ def convert_to_mp3(video_path, author, quality="medium"):
     output_filename = f"{os.path.splitext(os.path.basename(video_path))[0]}.mp3"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     
-    # Convert the video to MP3 using FFmpeg with optimized settings
-    ffmpeg_command = [
-        "ffmpeg", 
-        "-i", video_path,
-        "-vn",  # No video
-        "-ar", "44100",  # Audio sample rate
-        "-ac", "2",  # Stereo
-        "-b:a", bitrate,  # Configurable bitrate
-        "-metadata", f"artist={author}",  # Set artist metadata
-        "-f", "mp3",  # Force MP3 format
-        "-threads", "2",  # Limit threads to save resources
-        "-loglevel", "error",  # Reduce logging
-        output_path
-    ]
-    
-    process = subprocess.run(
-        ffmpeg_command, 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    
-    # Check if conversion was successful
-    if process.returncode != 0:
-        raise Exception(f"FFmpeg conversion failed: {process.stderr}")
-    
-    # Delete the original video file immediately to free up space
     try:
-        os.remove(video_path)
+        # Check if FFmpeg is available
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        
+        # Convert the video to MP3 using FFmpeg with optimized settings
+        ffmpeg_command = [
+            "ffmpeg", 
+            "-i", video_path,
+            "-vn",  # No video
+            "-ar", "44100",  # Audio sample rate
+            "-ac", "2",  # Stereo
+            "-b:a", bitrate,  # Configurable bitrate
+            "-metadata", f"artist={author[:30]}",  # Set artist metadata
+            "-f", "mp3",  # Force MP3 format
+            "-threads", "2",  # Limit threads to save resources
+            "-loglevel", "error",  # Reduce logging
+            "-y",  # Overwrite output files
+            output_path
+        ]
+        
+        process = subprocess.run(
+            ffmpeg_command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Check if conversion was successful
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg conversion failed: {process.stderr}")
+        
+        # Check if output file exists and has size
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise Exception("Output file was not created or is empty")
+        
     except Exception as e:
-        logger.warning(f"Could not delete original video file: {str(e)}")
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except:
+                pass
+        raise e
+    finally:
+        # Delete the original video file to free up space
+        try:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+        except Exception as e:
+            logger.warning(f"Could not delete original video file: {str(e)}")
     
     return output_path
 
@@ -345,7 +429,7 @@ def tiktok_to_mp3():
         return jsonify(result)
     
     except Exception as e:
-        logger.warning(f"Error processing TikTok to MP3: {str(e)}")
+        logger.error(f"Error processing TikTok to MP3: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/download/<filename>', methods=['GET'])
@@ -377,8 +461,16 @@ def status():
         video_cache_count = len(video_cache)
         file_cache_count = len(file_cache)
     
+    # Check if FFmpeg is available
+    ffmpeg_status = "available"
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception:
+        ffmpeg_status = "not available"
+    
     return jsonify({
         'status': 'running',
+        'ffmpeg': ffmpeg_status,
         'video_cache_count': video_cache_count,
         'file_cache_count': file_cache_count,
         'cache_expiry_seconds': CACHE_EXPIRY
@@ -411,8 +503,9 @@ if __name__ == '__main__':
     
     # Start the cleanup thread
     start_cleanup_thread()
-    logger.warning("Started cache cleanup thread")
+    logger.info("Started cache cleanup thread")
     
     # Start the Flask app with minimal settings
     print("Starting TikTok to MP3 Converter API...")
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False, threaded=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
