@@ -7,7 +7,9 @@ import hashlib
 import requests
 import subprocess
 import uuid
+import random
 from flask import Flask, request, jsonify, send_file
+from functools import wraps, lru_cache
 import threading
 
 app = Flask(__name__)
@@ -32,6 +34,25 @@ logger = logging.getLogger('tiktok_to_mp3')
 video_cache = {}  # For TikTok video info
 file_cache = {}   # For converted MP3 files
 cache_lock = threading.Lock()
+
+# TikWM API configurations
+TIKWM_DOMAINS = [
+    'https://www.tikwm.com/api/',
+    'https://tikwm.com/api/',
+    'https://m.tikwm.com/api/'
+]
+
+# User agents for rotation
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:100.0) Gecko/20100101 Firefox/100.0',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
+]
+
+# Request methods for TikWM
+REQUEST_METHODS = ['POST', 'GET']
 
 # Helper function for logging
 def log_message(message):
@@ -83,7 +104,9 @@ def extract_tiktok_id(url):
 # Follow redirects to get final URL
 def follow_tiktok_redirects(url):
     try:
-        response = requests.head(url, allow_redirects=True, timeout=10)
+        response = requests.head(url, allow_redirects=True, 
+                               headers={'User-Agent': random.choice(USER_AGENTS)},
+                               timeout=10)
         final_url = response.url
         log_message(f'Redirect resolved to: {final_url}')
         return final_url
@@ -91,83 +114,131 @@ def follow_tiktok_redirects(url):
         log_message(f'Error following redirect: {str(e)}')
         return url
 
-# Primary method: TikWM API
+# Enhanced TikWM API method with rotation
 def fetch_from_tikwm(url):
-    log_message(f'Trying TikWM API for: {url}')
+    # Try up to 3 different combinations of domains, user agents, and methods
+    for attempt in range(3):
+        domain = random.choice(TIKWM_DOMAINS)
+        user_agent = random.choice(USER_AGENTS)
+        method = random.choice(REQUEST_METHODS)
+        
+        log_message(f'Trying TikWM API with domain: {domain}, UA: {user_agent[:20]}..., method: {method}')
+        
+        # Add random delay to mimic human behavior
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        try:
+            headers = {
+                'User-Agent': user_agent,
+                'Referer': 'https://tikwm.com/',
+                'Origin': 'https://tikwm.com',
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
+                'Pragma': 'no-cache'
+            }
+            
+            if method == 'POST':
+                response = requests.post(
+                    domain,
+                    data={'url': url, 'hd': 1},  # Use highest quality
+                    headers=headers,
+                    timeout=15
+                )
+            else:  # GET method
+                response = requests.get(
+                    f"{domain}?url={url}&hd=1",
+                    headers=headers,
+                    timeout=15
+                )
+            
+            if response.status_code != 200:
+                log_message(f'TikWM API request failed with status: {response.status_code}')
+                continue
+            
+            data = response.json()
+            
+            if not data.get('data') or data.get('code') != 0:
+                log_message(f'TikWM API returned error: {data}')
+                continue
+            
+            video_data = data['data']
+            
+            return {
+                'video_url': video_data['play'],
+                'author': video_data['author']['unique_id'] if video_data.get('author') else 'tiktok_user',
+                'video_id': video_data['id'],
+                'method': 'tikwm'
+            }
+        except Exception as e:
+            log_message(f'Error using TikWM API: {str(e)}')
+            continue
     
-    api_url = 'https://www.tikwm.com/api/'
+    # All attempts failed
+    return None
+
+# Alternative TikWM approach using a mirror/proxy
+def fetch_from_tikwm_alt(url):
+    # Alternative endpoints that might work as TikWM mirrors
+    alt_endpoints = [
+        'https://api.tikmate.app/api/lookup',
+        'https://tiktok.ttwstatic.com/api',
+        'https://ttsave.app/api/lookup'
+    ]
+    
+    endpoint = random.choice(alt_endpoints)
+    log_message(f'Trying alternative TikWM endpoint: {endpoint}')
     
     try:
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'application/json'
+        }
+        
         response = requests.post(
-            api_url,
-            data={'url': url, 'hd': 0},  # Lower quality to save resources
+            endpoint,
+            data={'url': url},
+            headers=headers,
             timeout=15
         )
         
         if response.status_code != 200:
-            log_message(f'TikWM API request failed with status: {response.status_code}')
             return None
         
         data = response.json()
         
-        if not data.get('data') or data.get('code') != 0:
-            log_message(f'TikWM API returned error: {data}')
-            return None
+        # Different APIs might have different response structures
+        if data.get('success') == True and data.get('data'):
+            video_data = data['data']
+            return {
+                'video_url': video_data.get('play_url') or video_data.get('video_url'),
+                'author': video_data.get('author_id') or 'tiktok_user',
+                'video_id': video_data.get('id') or hashlib.md5(url.encode()).hexdigest()[:16],
+                'method': 'tikwm_alt'
+            }
         
-        video_data = data['data']
-        
-        return {
-            'video_url': video_data['play'],
-            'author': video_data['author']['unique_id'] if video_data.get('author') else 'tiktok_user',
-            'video_id': video_data['id'],
-            'method': 'tikwm'
-        }
+        return None
     except Exception as e:
-        log_message(f'Error using TikWM API: {str(e)}')
+        log_message(f'Error using alternative TikWM endpoint: {str(e)}')
         return None
 
-# Secondary method: Use Rapid API (SnapTik)
-def fetch_from_snaptik(url):
-    log_message(f'Trying SnapTik API for: {url}')
-    
-    api_url = "https://snaptik.p.rapidapi.com/video-info"
-    
-    payload = {"url": url}
-    headers = {
-        "content-type": "application/json",
-        "X-RapidAPI-Key": os.environ.get('RAPIDAPI_KEY', ''),
-        "X-RapidAPI-Host": "snaptik.p.rapidapi.com"
-    }
-    
-    if not headers["X-RapidAPI-Key"]:
-        log_message('No RapidAPI key found, skipping SnapTik')
-        return None
-    
-    try:
-        response = requests.post(api_url, json=payload, headers=headers, timeout=15)
-        data = response.json()
-        
-        if response.status_code != 200 or not data.get('url'):
-            log_message(f'SnapTik API request failed: {data}')
-            return None
-        
-        return {
-            'video_url': data['url'],
-            'author': data.get('username', 'tiktok_user'),
-            'video_id': hashlib.md5(url.encode()).hexdigest()[:16],
-            'method': 'snaptik'
-        }
-    except Exception as e:
-        log_message(f'Error using SnapTik API: {str(e)}')
-        return None
-
-# Simple fallback method - direct player URL extraction
+# Direct URL extraction as fallback
 def fetch_direct_url(url):
     log_message(f'Trying direct extraction for: {url}')
     
     try:
         # Try to get the page content
-        response = requests.get(url, timeout=15)
+        response = requests.get(
+            url,
+            headers={
+                'User-Agent': random.choice(USER_AGENTS)
+            },
+            timeout=15
+        )
         
         if response.status_code != 200:
             return None
@@ -256,17 +327,25 @@ def download_tiktok_video(url):
     if 'vm.tiktok.com' in url or 'vt.tiktok.com' in url:
         url = follow_tiktok_redirects(url)
     
-    # Try all methods in sequence
-    result = fetch_from_tikwm(url)
+    # Determine which method to use based on rotation
+    methods = [
+        fetch_from_tikwm,        # Primary TikWM method
+        fetch_from_tikwm_alt,    # Alternative TikWM approach
+        fetch_direct_url         # Direct URL extraction fallback
+    ]
+    
+    # Shuffle methods for rotation
+    random.shuffle(methods)
+    
+    # Try each method until one succeeds
+    result = None
+    for method in methods:
+        result = method(url)
+        if result and result.get('video_url'):
+            break
     
     if not result or not result.get('video_url'):
-        result = fetch_from_snaptik(url)
-        
-    if not result or not result.get('video_url'):
-        result = fetch_direct_url(url)
-    
-    if not result or not result.get('video_url'):
-        raise Exception("Failed to extract video URL from TikTok link. This may be due to TikTok's anti-scraping measures.")
+        raise Exception("Failed to extract video URL from TikTok link")
     
     video_url = result['video_url']
     author = result['author']
@@ -277,7 +356,12 @@ def download_tiktok_video(url):
     
     # Download the video with limited buffer size
     try:
-        response = requests.get(video_url, stream=True, timeout=20)
+        response = requests.get(
+            video_url, 
+            stream=True, 
+            timeout=20, 
+            headers={'User-Agent': random.choice(USER_AGENTS)}
+        )
         
         if response.status_code != 200:
             raise Exception(f"Failed to download video: HTTP {response.status_code}")
@@ -302,18 +386,19 @@ def download_tiktok_video(url):
         'file_path': file_path,
         'author': author,
         'video_id': result['video_id'],
-        'filename': filename
+        'filename': filename,
+        'method': result['method']
     }
 
-def convert_to_mp3(video_path, author, quality="medium"):
-    """Convert video to MP3 with configurable quality and return the MP3 file path"""
-    # Set bitrate based on quality
+def convert_to_mp3(video_path, author, quality="high"):
+    """Convert video to MP3 with highest quality"""
+    # Set bitrate based on quality (always use highest quality now)
     bitrates = {
-        "low": "64k",
-        "medium": "128k",
-        "high": "192k"
+        "low": "128k",
+        "medium": "256k",
+        "high": "320k"  # Maximum MP3 bitrate
     }
-    bitrate = bitrates.get(quality, "128k")
+    bitrate = bitrates.get(quality, "320k")
     
     # Generate output filename
     output_filename = f"{os.path.splitext(os.path.basename(video_path))[0]}.mp3"
@@ -323,19 +408,20 @@ def convert_to_mp3(video_path, author, quality="medium"):
         # Check if FFmpeg is available
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         
-        # Convert the video to MP3 using FFmpeg with optimized settings
+        # Convert the video to MP3 using FFmpeg with optimized high-quality settings
         ffmpeg_command = [
             "ffmpeg", 
             "-i", video_path,
-            "-vn",  # No video
-            "-ar", "44100",  # Audio sample rate
-            "-ac", "2",  # Stereo
-            "-b:a", bitrate,  # Configurable bitrate
+            "-vn",                # No video
+            "-ar", "48000",       # 48kHz sample rate (studio quality)
+            "-ac", "2",           # Stereo
+            "-b:a", bitrate,      # High bitrate
+            "-q:a", "0",          # Highest quality VBR
+            "-compression_level", "0",  # No compression
             "-metadata", f"artist={author[:30]}",  # Set artist metadata
-            "-f", "mp3",  # Force MP3 format
-            "-threads", "2",  # Limit threads to save resources
-            "-loglevel", "error",  # Reduce logging
-            "-y",  # Overwrite output files
+            "-metadata", f"title=TikTok Audio",    # Set title metadata
+            "-f", "mp3",          # Force MP3 format
+            "-y",                 # Overwrite output files
             output_path
         ]
         
@@ -409,11 +495,11 @@ def tiktok_to_mp3():
         return jsonify({'success': False, 'error': 'TikTok URL is required'}), 400
     
     tiktok_url = data['url'].strip()
-    quality = data.get('quality', 'medium')  # Default to medium quality
+    quality = data.get('quality', 'high')  # Default to high quality
     
     # Validate quality parameter
     if quality not in ['low', 'medium', 'high']:
-        quality = 'medium'
+        quality = 'high'
         
     url_hash = hashlib.md5((tiktok_url + quality).encode()).hexdigest()
     
@@ -446,6 +532,7 @@ def tiktok_to_mp3():
             'filename': mp3_filename,
             'author': video_info['author'],
             'quality': quality,
+            'method': video_info.get('method', 'unknown'),
             'cached': False
         }
         
@@ -455,18 +542,8 @@ def tiktok_to_mp3():
         return jsonify(result)
     
     except Exception as e:
-        error_message = str(e)
-        logger.error(f"Error processing TikTok to MP3: {error_message}")
-        
-        # Provide more helpful error messages for common issues
-        if "403" in error_message:
-            error_message = "Access denied by TikTok (HTTP 403). The video may be private or TikTok may be blocking our request."
-        
-        return jsonify({
-            'success': False, 
-            'error': error_message,
-            'url': tiktok_url
-        }), 500
+        logger.error(f"Error processing TikTok to MP3: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/download/<filename>', methods=['GET'])
 def download_file(filename):
@@ -497,6 +574,13 @@ def status():
         video_cache_count = len(video_cache)
         file_cache_count = len(file_cache)
     
+    # Get methods usage statistics
+    method_stats = {}
+    for data in video_cache.values():
+        if 'data' in data and 'method' in data['data']:
+            method = data['data']['method']
+            method_stats[method] = method_stats.get(method, 0) + 1
+    
     # Check if FFmpeg is available
     ffmpeg_status = "available"
     try:
@@ -509,6 +593,7 @@ def status():
         'ffmpeg': ffmpeg_status,
         'video_cache_count': video_cache_count,
         'file_cache_count': file_cache_count,
+        'method_stats': method_stats,
         'cache_expiry_seconds': CACHE_EXPIRY
     })
 
