@@ -627,11 +627,11 @@ if __name__ == '__main__':
     print(f"  - Cache directory: {CACHE_DIR}")
     print(f"  - ffmpeg available: {'Yes' if ffmpeg_path else 'No'}")
     
-    # Set host and port for Render or local development
-    host = os.environ.get('HOST', '0.0.0.0')
-    port = int(os.environ.get('PORT', 5000))
-    
-    print(f"\nServer is starting on http://{host}:{port}\n")
-    
-    # Run the Flask app
-    app.run(
+   # Set host and port for Render or local development
+host = os.environ.get('HOST', '0.0.0.0')
+port = int(os.environ.get('PORT', 5000))
+
+print(f"\nServer is starting on http://{host}:{port}\n")
+
+# Run the Flask app
+app.run(host=host, port=port)
