@@ -704,17 +704,19 @@ def get_tiktok_video(url, quality="192"):
                 if video_path:
                     logger.info(f"Successfully downloaded video using {method.__name__}")
                     
-                   # Convert video to MP3 with specified quality
-                    mp3_path = convert_video_to_mp3(video_path, video_id, quality)
-                    
-                    if mp3_path:
-                        logger.info(f"Successfully converted video to MP3: {mp3_path}")
-                        return mp3_path, video_id
-                    else:
-                        logger.error("Failed to convert video to MP3")
-                        
-                except Exception as e:
-                    logger.error(f"Error in method {method.__name__}: {e}")
+                   try:
+    # Convert video to MP3 with specified quality
+    mp3_path = convert_video_to_mp3(video_path, video_id, quality)
+    
+    if mp3_path:
+        logger.info(f"Successfully converted video to MP3: {mp3_path}")
+        return mp3_path, video_id
+    else:
+        logger.error("Failed to convert video to MP3")
+
+except Exception as e:
+    logger.error(f"Error in method {method.__name__}: {e}")
+
         
         # If we get here, all methods failed
         logger.error(f"All download methods failed for video ID: {video_id}")
