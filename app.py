@@ -686,253 +686,423 @@ def get_tiktok_video(url, quality="192"):
         # Mark this download as in progress
         active_downloads[video_id] = True
     
-   try:
-    # List of methods to try in order
-    methods = [
-        download_tiktok_video_mobile,
-        download_tiktok_video_scraper,  # Added new method
-        download_tiktok_video_web,
-        download_tiktok_video_embed
-    ]
-
-    video_path = None
-    for method in methods:
-        try:
-            logger.info(f"Trying download method: {method.__name__}")
-            video_path = method(video_id)
-
-            if video_path:
-                logger.info(f"Successfully downloaded video using {method.__name__}")
+    try:
+        # List of methods to try in order
+        methods = [
+            download_tiktok_video_mobile,
+            download_tiktok_video_scraper,  # Added new method
+            download_tiktok_video_web,
+            download_tiktok_video_embed
+        ]
+        
+        video_path = None
+        for method in methods:
+            try:
+                logger.info(f"Trying download method: {method.__name__}")
+                video_path = method(video_id)
                 
-                try:
+                if video_path:
+                    logger.info(f"Successfully downloaded video using {method.__name__}")
+                    
                     # Convert video to MP3 with specified quality
                     mp3_path = convert_video_to_mp3(video_path, video_id, quality)
-
                     if mp3_path:
-                        logger.info(f"Successfully converted video to MP3: {mp3_path}")
                         return mp3_path, video_id
-                    else:
-                        logger.error("Failed to convert video to MP3")
-
-                except Exception as e:
-                    logger.error(f"Error converting video to MP3 with method {method.__name__}: {e}")
-
-        except Exception as e:
-            logger.error(f"Error downloading video using method {method.__name__}: {e}")
-
-except Exception as e:
-    logger.error(f"Unexpected error: {e}")
-
-
+                        
+                # Wait a moment before trying the next method to avoid rate limiting
+                time.sleep(random.uniform(0.5, 1.5))
+            except Exception as e:
+                logger.error(f"Error in download method {method.__name__}: {e}")
         
-        # If we get here, all methods failed
-        logger.error(f"All download methods failed for video ID: {video_id}")
+        logger.error("All download methods failed")
         return None, video_id
     finally:
-        # Remove the download from active downloads
+        # Remove the video ID from active downloads
         with active_downloads_lock:
             if video_id in active_downloads:
                 del active_downloads[video_id]
 
-def check_cache_size():
-    """Check if cache size exceeds limit and clean up if necessary."""
+def cleanup_old_files():
+    """Clean up old temporary files to prevent disk space issues."""
     try:
-        # Get total size of temp directory
-        total_size = sum(os.path.getsize(os.path.join(TEMP_DIR, f)) for f in os.listdir(TEMP_DIR) if os.path.isfile(os.path.join(TEMP_DIR, f)))
-        total_size_mb = total_size / (1024 * 1024)
+        current_time = time.time()
+        files_to_delete = []
+        total_size = 0
         
-        if total_size_mb > MAX_CACHE_SIZE_MB:
-            logger.info(f"Cache size exceeds limit ({total_size_mb:.2f}MB > {MAX_CACHE_SIZE_MB}MB). Cleaning up...")
+        # First calculate total size and sort files by age
+        files_info = []
+        for filename in os.listdir(TEMP_DIR):
+            file_path = os.path.join(TEMP_DIR, filename)
+            if os.path.isfile(file_path):
+                file_size = os.path.getsize(file_path)
+                file_mtime = os.path.getmtime(file_path)
+                files_info.append((file_path, file_size, file_mtime))
+                total_size += file_size
+        
+        # Sort files by modification time (oldest first)
+        files_info.sort(key=lambda x: x[2])
+        
+        # If total size exceeds MAX_CACHE_SIZE_MB, delete oldest files first
+        if total_size > MAX_CACHE_SIZE_MB * 1024 * 1024:
+            logger.info(f"Cache size ({total_size/(1024*1024):.2f} MB) exceeds limit ({MAX_CACHE_SIZE_MB} MB). Cleaning up...")
             
-            # Get list of files with their modification times
-            files = [(f, os.path.getmtime(os.path.join(TEMP_DIR, f))) 
-                    for f in os.listdir(TEMP_DIR) 
-                    if os.path.isfile(os.path.join(TEMP_DIR, f))]
-            
-            # Sort by modification time (oldest first)
-            files.sort(key=lambda x: x[1])
-            
-            # Delete files until we're under 80% of the limit
-            while total_size_mb > (MAX_CACHE_SIZE_MB * 0.8) and files:
-                file_to_delete, _ = files.pop(0)
-                file_path = os.path.join(TEMP_DIR, file_to_delete)
-                file_size = os.path.getsize(file_path) / (1024 * 1024)
-                
-                logger.info(f"Deleting {file_to_delete} ({file_size:.2f}MB)")
+            for file_path, file_size, file_mtime in files_info:
                 os.remove(file_path)
-                
-                total_size_mb -= file_size
-    except Exception as e:
-        logger.error(f"Error checking cache size: {e}")
-
-# Start a background thread to periodically clean the cache
-def cache_cleaner():
-    """Background thread to periodically clean the cache."""
-    while True:
-        try:
-            check_cache_size()
-        except Exception as e:
-            logger.error(f"Error in cache cleaner: {e}")
+                logger.info(f"Removed file to reduce cache size: {os.path.basename(file_path)}")
+                total_size -= file_size
+                if total_size <= MAX_CACHE_SIZE_MB * 0.9 * 1024 * 1024:  # Clean until we're under 90% of max
+                    break
         
-        # Sleep for 1 hour
-        time.sleep(3600)
+        # Now delete expired files
+        for file_path, file_size, file_mtime in files_info:
+            if current_time - file_mtime > CACHE_EXPIRATION:
+                os.remove(file_path)
+                logger.info(f"Removed expired file: {os.path.basename(file_path)}")
+    except Exception as e:
+        logger.error(f"Error cleaning up old files: {e}")
 
-# Start the cache cleaner thread
-cache_thread = threading.Thread(target=cache_cleaner, daemon=True)
-cache_thread.start()
-
-@app.route('/api/download', methods=['POST'])
-def download_tiktok():
-    """Endpoint to download TikTok videos and convert to MP3."""
-    if not can_perform_download():
-        return jsonify({
-            "error": "Rate limit exceeded. Please try again later."
-        }), 429
+def validate_input(data):
+    """Validate and sanitize incoming request data."""
+    if not data or not isinstance(data, dict):
+        return False, {"error": "Invalid JSON data"}, 400
+        
+    url = data.get('url', '').strip()
+    if not url:
+        return False, {"error": "No URL provided"}, 400
     
-    # Get request data
-    data = request.get_json()
-    
-    # Check for required fields
-    if not data or 'url' not in data:
-        return jsonify({
-            "error": "Missing required field: url"
-        }), 400
-    
-    url = data['url']
-    quality = data.get('quality', '192')  # Default to 192kbps if not specified
-    turnstile_token = data.get('turnstileToken')
-    
-    # Verify Turnstile token if provided
-    if turnstile_token:
-        success, errors = verify_turnstile_token(turnstile_token, request.remote_addr)
-        if not success:
-            return jsonify({
-                "error": "Invalid turnstile token",
-                "details": errors
-            }), 403
-    
-    # Validate URL
     if not is_valid_tiktok_url(url):
-        return jsonify({
-            "error": "Invalid TikTok URL"
-        }), 400
+        return False, {"error": "Invalid TikTok URL"}, 400
     
-    # Track download attempt
-    stats.increment_total()
+    # Validate quality parameter
+    quality = data.get('quality', '192').strip()
+    if quality not in ['128', '192', '256', '320']:
+        quality = '192'  # Default to 192 kbps if invalid
     
+    # Validate turnstile token if required
+    if app.config.get('REQUIRE_TURNSTILE', False):
+        token = data.get('turnstile_token')
+        if not token:
+            return False, {"error": "Turnstile verification required"}, 403
+    
+    return True, {"url": url, "quality": quality, "turnstile_token": data.get('turnstile_token')}, 200
+
+@app.before_request
+def before_request():
+    """Add security headers to all responses."""
+    # Clean up files occasionally to prevent disk space issues
+    if random.random() < 0.05:  # 5% chance to trigger cleanup
+        threading.Thread(target=cleanup_old_files).start()
+
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to response."""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
+@app.errorhandler(Exception)
+def handle_error(e):
+    """Global error handler."""
+    logger.error(f"Unhandled exception: {str(e)}")
+    return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint to verify service is running."""
+    return jsonify({
+        "status": "ok", 
+        "message": "TikTok to MP3 converter service is running",
+        "version": "2.0.0",
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/api/convert', methods=['POST'])
+def convert_tiktok_to_mp3():
+    """API endpoint to download TikTok videos and convert to MP3."""
     try:
-        # Get video and convert to MP3
+        # Rate limiting check
+        if not can_perform_download():
+            return jsonify({"error": "Rate limit exceeded. Please try again later."}), 429
+            
+        # Parse and validate input
+        data = request.json
+        is_valid, result, status_code = validate_input(data)
+        
+        if not is_valid:
+            return jsonify(result), status_code
+            
+        url = result["url"]
+        quality = result["quality"]
+        turnstile_token = result["turnstile_token"]
+        
+        # Verify Cloudflare Turnstile token if enabled
+        if app.config.get('REQUIRE_TURNSTILE', False) and turnstile_token:
+            is_valid, error_codes = verify_turnstile_token(
+                turnstile_token, 
+                request.remote_addr
+            )
+            
+            if not is_valid:
+                logger.warning(f"Turnstile verification failed: {error_codes}")
+                return jsonify({"error": "Turnstile verification failed", "details": error_codes}), 403
+        
+        # Update download statistics
+        stats.increment_total()
+        
+        # Try to download the video and convert to MP3
         mp3_path, video_id = get_tiktok_video(url, quality)
         
         if not mp3_path:
             stats.increment_failed()
-            return jsonify({
-                "error": "Failed to download or convert video"
-            }), 500
-        
-        # Generate download token
-        download_token = hashlib.md5(f"{video_id}_{quality}_{int(time.time())}".encode()).hexdigest()
-        
-        # Store token for later verification
-        app.config.setdefault('DOWNLOAD_TOKENS', {})[download_token] = {
-            'path': mp3_path,
-            'video_id': video_id,
-            'expires': time.time() + 3600  # Token expires in 1 hour
-        }
-        
+            return jsonify({"error": "Failed to download and convert video"}), 500
+            
+        # Successfully downloaded and converted
         stats.increment_success()
         
-        return jsonify({
-            "success": True,
-            "token": download_token,
-            "video_id": video_id
-        })
-        
-    except Exception as e:
-        logger.error(f"Error processing download request: {e}")
-        stats.increment_failed()
-        return jsonify({
-            "error": "Failed to process request",
-            "details": str(e)
-        }), 500
-
-@app.route('/api/download/<token>', methods=['GET'])
-def get_download(token):
-    """Endpoint to retrieve the converted MP3 file using a token."""
-    # Verify token
-    download_tokens = app.config.get('DOWNLOAD_TOKENS', {})
-    if token not in download_tokens:
-        return jsonify({
-            "error": "Invalid or expired download token"
-        }), 404
-    
-    # Get download info
-    download_info = download_tokens[token]
-    
-    # Check if token is expired
-    if download_info['expires'] < time.time():
-        # Remove expired token
-        del download_tokens[token]
-        return jsonify({
-            "error": "Download token expired"
-        }), 410
-    
-    # Check if file exists
-    mp3_path = download_info['path']
-    if not os.path.exists(mp3_path):
-        return jsonify({
-            "error": "File not found"
-        }), 404
-    
-    # Get TikTok video ID for filename
-    video_id = download_info['video_id']
-    
-    try:
-        # Send the file
+        # Set appropriate headers for download
         return send_file(
-            mp3_path,
-            as_attachment=True,
-            download_name=f"tiktok_{video_id}.mp3",
+            mp3_path, 
+            as_attachment=True, 
+            download_name=f"tiktok_{video_id}_{quality}kbps.mp3",
             mimetype="audio/mpeg"
         )
+        
     except Exception as e:
-        logger.error(f"Error sending file: {e}")
-        return jsonify({
-            "error": "Failed to send file",
-            "details": str(e)
-        }), 500
+        logger.error(f"Unexpected error: {e}")
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    """Endpoint to get download statistics."""
-    return jsonify(stats.get_stats())
+    """API endpoint to get service statistics."""
+    try:
+        # Count files by extension
+        file_counts = {
+            "mp3_files": 0,
+            "mp4_files": 0,
+            "other_files": 0
+        }
+        
+        total_size = 0
+        oldest_file_time = time.time()
+        newest_file_time = 0
+        
+        for f in os.listdir(TEMP_DIR):
+            file_path = os.path.join(TEMP_DIR, f)
+            if not os.path.isfile(file_path):
+                continue
+                
+            # Update file counts
+            if f.endswith('.mp3'):
+                file_counts["mp3_files"] += 1
+            elif f.endswith('.mp4'):
+                file_counts["mp4_files"] += 1
+            else:
+                file_counts["other_files"] += 1
+            
+            # Update total size
+            file_size = os.path.getsize(file_path)
+            total_size += file_size
+            
+            # Update file time stats
+            file_time = os.path.getmtime(file_path)
+            oldest_file_time = min(oldest_file_time, file_time)
+            newest_file_time = max(newest_file_time, file_time)
+        
+        # Calculate cache age in hours
+        cache_age = {
+            "oldest_file_hours": round((time.time() - oldest_file_time) / 3600, 2) if oldest_file_time < time.time() else 0,
+            "newest_file_hours": round((time.time() - newest_file_time) / 3600, 2) if newest_file_time > 0 else 0
+        }
+        
+        # Get download statistics
+        download_stats = stats.get_stats()
+        
+        # System information
+        system_info = {
+            "temp_dir": TEMP_DIR,
+            "free_space_mb": shutil.disk_usage(TEMP_DIR).free / (1024 * 1024),
+            "total_space_mb": shutil.disk_usage(TEMP_DIR).total / (1024 * 1024),
+            "active_downloads": len(active_downloads)
+        }
+        
+        return jsonify({
+            "status": "ok",
+            "stats": {
+                "files": file_counts,
+                "total_files": sum(file_counts.values()),
+                "cache_dir_size_mb": round(total_size / (1024 * 1024), 2),
+                "cache_age": cache_age,
+                "downloads": download_stats,
+                "system": system_info
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return jsonify({"error": f"Error getting stats: {str(e)}"}), 500
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Endpoint for health checks."""
-    return jsonify({
-        "status": "ok",
-        "cache_size_mb": sum(os.path.getsize(os.path.join(TEMP_DIR, f)) for f in os.listdir(TEMP_DIR) if os.path.isfile(os.path.join(TEMP_DIR, f))) / (1024 * 1024),
-        "active_downloads": len(active_downloads),
-        "uptime": int(time.time() - app.config.get('START_TIME', time.time()))
-    })
+@app.route('/api/clear-cache', methods=['POST'])
+def clear_cache():
+    """Endpoint to clear the cache (requires admin secret)."""
+    try:
+        # Simple admin authentication
+        admin_secret = request.headers.get('X-Admin-Secret')
+        if not admin_secret or admin_secret != os.environ.get('ADMIN_SECRET', 'change_this_secret'):
+            return jsonify({"error": "Unauthorized"}), 401
+            
+        # Clear the cache
+        files_removed = 0
+        for filename in os.listdir(TEMP_DIR):
+            file_path = os.path.join(TEMP_DIR, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                files_removed += 1
+                
+        # Clear the function caches
+        download_tiktok_video_mobile.cache_clear()
+        download_tiktok_video_web.cache_clear()
+        download_tiktok_video_embed.cache_clear()
+        download_tiktok_video_scraper.cache_clear()
+        
+        return jsonify({
+            "status": "ok",
+            "message": f"Cache cleared successfully. Removed {files_removed} files."
+        })
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}")
+        return jsonify({"error": f"Error clearing cache: {str(e)}"}), 500
 
-# Set start time when the app initializes
-app.config['START_TIME'] = time.time()
-
-# Cleanup function to run periodically
-@app.before_first_request
-def initialize():
-    """Initialize the application."""
-    # Clean up old files at startup
-    check_cache_size()
+def configure_app():
+    """Configure the Flask app with environment variables."""
+    # Turnstile configuration
+    app.config['REQUIRE_TURNSTILE'] = os.environ.get('REQUIRE_TURNSTILE', 'false').lower() == 'true'
+    
+    # Cache configuration
+    global CACHE_EXPIRATION, MAX_CACHE_SIZE_MB
+    CACHE_EXPIRATION = int(os.environ.get('CACHE_EXPIRATION_SECONDS', CACHE_EXPIRATION))
+    MAX_CACHE_SIZE_MB = int(os.environ.get('MAX_CACHE_SIZE_MB', MAX_CACHE_SIZE_MB))
+    
+    # Rate limiting configuration
+    global MAX_DOWNLOADS_PER_MINUTE
+    MAX_DOWNLOADS_PER_MINUTE = int(os.environ.get('MAX_DOWNLOADS_PER_MINUTE', MAX_DOWNLOADS_PER_MINUTE))
+    
+    # Configure proxies if provided
+    global PROXIES
+    proxy_url = os.environ.get('HTTP_PROXY')
+    if proxy_url:
+        PROXIES = {
+            "http": proxy_url,
+            "https": proxy_url
+        }
+    
+    logger.info("Application configured successfully")
+    logger.info(f"Turnstile verification required: {app.config['REQUIRE_TURNSTILE']}")
+    logger.info(f"Cache expiration: {CACHE_EXPIRATION} seconds")
+    logger.info(f"Max cache size: {MAX_CACHE_SIZE_MB} MB")
+    logger.info(f"Rate limit: {MAX_DOWNLOADS_PER_MINUTE} downloads per minute")
+    logger.info(f"Using proxies: {PROXIES is not None}")
 
 if __name__ == '__main__':
-    # Create temp directory if it doesn't exist
-    os.makedirs(TEMP_DIR, exist_ok=True)
+    # Create a README file for Render deployment
+    readme_path = 'README.md'
+    with open(readme_path, 'w') as f:
+        f.write("""# TikTok to MP3 Converter API
+
+A Flask-based API service that downloads TikTok videos and converts them to MP3 format.
+
+## Features
+- Download TikTok videos using multiple fallback methods
+- Convert videos to MP3 with customizable quality (128, 192, 256, or 320 kbps)
+- Cloudflare Turnstile protection to prevent abuse
+- Rate limiting and cache management
+- Multiple download methods with fallback for reliability
+
+## Requirements
+- Python 3.8+
+- FFmpeg must be installed on the system
+
+## Environment Variables
+- `REQUIRE_TURNSTILE`: Set to 'true' to enable Cloudflare Turnstile verification (default: false)
+- `TURNSTILE_SECRET_KEY`: Your Cloudflare Turnstile secret key
+- `CACHE_EXPIRATION_SECONDS`: Time in seconds before cached files expire (default: 86400)
+- `MAX_CACHE_SIZE_MB`: Maximum cache size in MB (default: 5000)
+- `MAX_DOWNLOADS_PER_MINUTE`: Rate limit for downloads (default: 20)
+- `ADMIN_SECRET`: Secret key for admin operations like cache clearing
+- `HTTP_PROXY`: Optional proxy URL for outgoing requests
+
+## API Endpoints
+- POST /api/convert: Convert TikTok video to MP3
+- GET /api/health: Health check endpoint
+- GET /api/stats: Get service statistics
+- POST /api/clear-cache: Clear the cache (requires admin authentication)
+
+## Deployment
+This service is designed to be deployed on Render.com.
+
+### Render.com Setup
+1. Create a new Web Service
+2. Use the Docker Runtime
+3. Set the required environment variables
+4. Make sure to install FFmpeg in your build script
+""")
+
+    # Create a Dockerfile for Render deployment
+    dockerfile_path = 'Dockerfile'
+    with open(dockerfile_path, 'w') as f:
+        f.write("""FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install FFmpeg and other dependencies
+RUN apt-get update && \\
+    apt-get install -y ffmpeg curl && \\
+    apt-get clean && \\
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create log directory
+RUN mkdir -p /var/log/tiktok_converter
+
+# Expose port
+EXPOSE 8080
+
+# Command to run the application
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 4 --threads 2 --timeout 120 app:app
+""")
+
+    # Create requirements.txt for dependencies
+    requirements_path = 'requirements.txt'
+    with open(requirements_path, 'w') as f:
+        f.write("""flask==2.3.3
+flask-cors==4.0.0
+requests==2.31.0
+gunicorn==21.2.0
+""")
+
+    # Configure the application
+    configure_app()
+
+    print("TikTok to MP3 Converter API Server 2.0")
+    print("----------------------------")
+    print("API Endpoints:")
+    print("  - POST /api/convert: Convert TikTok videos to MP3")
+    print("  - GET /api/health: Health check endpoint")
+    print("  - GET /api/stats: Get service statistics")
+    print("  - POST /api/clear-cache: Clear the cache (requires admin authentication)")
+    print("\nServer is starting on http://0.0.0.0:8080\n")
     
-    # Log startup information
-    logger.info(f"Starting TikTok to MP3 Converter API. Temp directory: {TEMP_DIR}")
-    
-    # Run the Flask app
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    # Run the Flask app with gunicorn configuration for production
+    port = int(os.environ.get("PORT", 8080))
+    app.run(
+        host='0.0.0.0',  # Allow external connections for production
+        port=port,
+        debug=False,
+        threaded=True
+    )
