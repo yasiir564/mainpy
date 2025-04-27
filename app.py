@@ -686,36 +686,43 @@ def get_tiktok_video(url, quality="192"):
         # Mark this download as in progress
         active_downloads[video_id] = True
     
-    try:
-        # List of methods to try in order
-        methods = [
-            download_tiktok_video_mobile,
-            download_tiktok_video_scraper,  # Added new method
-            download_tiktok_video_web,
-            download_tiktok_video_embed
-        ]
-        
-        video_path = None
-        for method in methods:
-            try:
-                logger.info(f"Trying download method: {method.__name__}")
-                video_path = method(video_id)
+   try:
+    # List of methods to try in order
+    methods = [
+        download_tiktok_video_mobile,
+        download_tiktok_video_scraper,  # Added new method
+        download_tiktok_video_web,
+        download_tiktok_video_embed
+    ]
+
+    video_path = None
+    for method in methods:
+        try:
+            logger.info(f"Trying download method: {method.__name__}")
+            video_path = method(video_id)
+
+            if video_path:
+                logger.info(f"Successfully downloaded video using {method.__name__}")
                 
-                if video_path:
-                    logger.info(f"Successfully downloaded video using {method.__name__}")
-                    
-                   try:
-    # Convert video to MP3 with specified quality
-    mp3_path = convert_video_to_mp3(video_path, video_id, quality)
-    
-    if mp3_path:
-        logger.info(f"Successfully converted video to MP3: {mp3_path}")
-        return mp3_path, video_id
-    else:
-        logger.error("Failed to convert video to MP3")
+                try:
+                    # Convert video to MP3 with specified quality
+                    mp3_path = convert_video_to_mp3(video_path, video_id, quality)
+
+                    if mp3_path:
+                        logger.info(f"Successfully converted video to MP3: {mp3_path}")
+                        return mp3_path, video_id
+                    else:
+                        logger.error("Failed to convert video to MP3")
+
+                except Exception as e:
+                    logger.error(f"Error converting video to MP3 with method {method.__name__}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error downloading video using method {method.__name__}: {e}")
 
 except Exception as e:
-    logger.error(f"Error in method {method.__name__}: {e}")
+    logger.error(f"Unexpected error: {e}")
+
 
         
         # If we get here, all methods failed
