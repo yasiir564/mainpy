@@ -13,11 +13,13 @@ import subprocess
 import hashlib
 from functools import lru_cache
 import shutil
+import threading
+from datetime import datetime
 
 # Check if ffmpeg is installed
 try:
-    subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-except FileNotFoundError:
+    subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+except (FileNotFoundError, subprocess.CalledProcessError):
     print("Error: ffmpeg is not installed or not in PATH. Please install ffmpeg.")
     exit(1)
 
@@ -25,11 +27,16 @@ app = Flask(__name__)
 # Configure CORS to allow specific origins in production or any in development
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+# Cloudflare Turnstile Configuration
+TURNSTILE_SECRET_KEY = "0x4AAAAAABHoxYr9SKSH_1ZBB4LpXbr_0sQ"  # Replace with your actual secret key
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
+        logging.FileHandler("tiktok_converter.log"),
         logging.StreamHandler()
     ]
 )
@@ -40,30 +47,132 @@ TEMP_DIR = os.path.join(tempfile.gettempdir(), 'tiktok_downloader')
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # Set cache size and expiration time (in seconds)
-CACHE_SIZE = 100
-CACHE_EXPIRATION = 3600  # 1 hour
+CACHE_SIZE = 200
+CACHE_EXPIRATION = 86400  # 24 hours
+MAX_CACHE_SIZE_MB = 5000  # 5GB maximum cache size
 
-# List of user agents to rotate
+# List of user agents to rotate - expanded for better undetectability
 USER_AGENTS = [
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_8_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 11; SM-A515F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.104 Mobile Safari/537.36",
-    "Mozilla/5.0 (iPad; CPU OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/119.0.6045.109 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.80 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 312.0.0.0.41",
+    "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+    "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36"
 ]
 
+# List of cookies to rotate
+TT_COOKIES = [
+    "tt_webid_v2=123456789012345678; tt_webid=123456789012345678; ttwid=1%7CAbC123dEf456gHi789jKl%7C1600000000%7Cabcdef0123456789abcdef0123456789; msToken=AbC123dEf456gHi789jKl",
+    "tt_webid_v2=234567890123456789; tt_webid=234567890123456789; ttwid=1%7CBcD234eFg567hIj890kLm%7C1600100000%7Cbcdefg1234567890abcdef0123456789; msToken=BcD234eFg567hIj890kLm",
+    "tt_webid_v2=345678901234567890; tt_webid=345678901234567890; ttwid=1%7CCdE345fGh678iJk901lMn%7C1600200000%7Ccdefgh2345678901abcdef0123456789; msToken=CdE345fGh678iJk901lMn",
+]
+
+# Proxy configuration (optional)
+# Format: {"http": "http://user:pass@host:port", "https": "http://user:pass@host:port"}
+PROXIES = None
+
+# Download rate limiting
+MAX_DOWNLOADS_PER_MINUTE = 20
+download_timestamps = []
+download_lock = threading.Lock()
+
+# Track active downloads
+active_downloads = {}
+active_downloads_lock = threading.Lock()
+
+class DownloadStats:
+    def __init__(self):
+        self.total_downloads = 0
+        self.successful_downloads = 0
+        self.failed_downloads = 0
+        self.last_download_time = None
+        self.lock = threading.Lock()
+        
+    def increment_total(self):
+        with self.lock:
+            self.total_downloads += 1
+            self.last_download_time = datetime.now()
+            
+    def increment_success(self):
+        with self.lock:
+            self.successful_downloads += 1
+            
+    def increment_failed(self):
+        with self.lock:
+            self.failed_downloads += 1
+            
+    def get_stats(self):
+        with self.lock:
+            return {
+                "total": self.total_downloads,
+                "successful": self.successful_downloads,
+                "failed": self.failed_downloads,
+                "last_download": self.last_download_time.isoformat() if self.last_download_time else None
+            }
+
+stats = DownloadStats()
+
 def get_random_user_agent():
+    """Get a random user agent from the list."""
     return random.choice(USER_AGENTS)
 
-def generate_cache_key(url, format_type="mp3"):
-    """Generate a unique cache key based on URL and format type."""
-    key = f"{url}_{format_type}"
+def get_random_cookies():
+    """Get random cookies for TikTok requests."""
+    return random.choice(TT_COOKIES)
+
+def can_perform_download():
+    """Rate limiting for downloads."""
+    global download_timestamps
+    
+    with download_lock:
+        current_time = time.time()
+        # Remove timestamps older than 60 seconds
+        download_timestamps = [ts for ts in download_timestamps if current_time - ts < 60]
+        
+        if len(download_timestamps) >= MAX_DOWNLOADS_PER_MINUTE:
+            return False
+        
+        download_timestamps.append(current_time)
+        return True
+
+def verify_turnstile_token(token, remote_ip=None):
+    """Verify Cloudflare Turnstile token."""
+    try:
+        data = {
+            "secret": TURNSTILE_SECRET_KEY,
+            "response": token
+        }
+        
+        if remote_ip:
+            data["remoteip"] = remote_ip
+            
+        response = requests.post(TURNSTILE_VERIFY_URL, data=data, timeout=10)
+        result = response.json()
+        
+        if result.get("success"):
+            return True, None
+        else:
+            return False, result.get("error-codes", ["Unknown error"])
+    except Exception as e:
+        logger.error(f"Turnstile verification error: {e}")
+        return False, ["Verification service error"]
+
+def generate_cache_key(url, format_type="mp3", quality="192"):
+    """Generate a unique cache key based on URL, format type and quality."""
+    key = f"{url}_{format_type}_{quality}"
     return hashlib.md5(key.encode()).hexdigest()
 
 def is_valid_tiktok_url(url):
     """Check if the URL is a valid TikTok URL."""
     parsed_url = urlparse(url)
-    return parsed_url.netloc in ["www.tiktok.com", "tiktok.com", "vm.tiktok.com", "vt.tiktok.com"]
+    return parsed_url.netloc in ["www.tiktok.com", "tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com"]
 
 def expand_shortened_url(url):
     """Expand a shortened TikTok URL."""
@@ -78,13 +187,14 @@ def expand_shortened_url(url):
 def extract_video_id(url):
     """Extract the video ID from a TikTok URL."""
     # Handle shortened URLs
-    if "vm.tiktok.com" in url or "vt.tiktok.com" in url:
+    if any(domain in url for domain in ["vm.tiktok.com", "vt.tiktok.com"]):
         url = expand_shortened_url(url)
     
     # Extract video ID from URL
     patterns = [
         r'/video/(\d+)',
-        r'tiktok\.com\/@[\w.-]+/video/(\d+)'
+        r'tiktok\.com\/@[\w.-]+/video/(\d+)',
+        r'v/(\d+)'
     ]
     
     for pattern in patterns:
@@ -94,6 +204,32 @@ def extract_video_id(url):
     
     return None
 
+def get_random_request_headers(referer=None):
+    """Generate randomized headers for HTTP requests."""
+    headers = {
+        "User-Agent": get_random_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache"
+    }
+    
+    if referer:
+        headers["Referer"] = referer
+        
+    # Add cookies to some requests for better undetectability
+    if random.random() < 0.7:  # 70% chance to add cookies
+        headers["Cookie"] = get_random_cookies()
+    
+    return headers
+
 @lru_cache(maxsize=CACHE_SIZE)
 def download_tiktok_video_mobile(video_id):
     """Download TikTok video using the mobile website."""
@@ -101,17 +237,15 @@ def download_tiktok_video_mobile(video_id):
         # Direct video URL
         mobile_url = f"https://m.tiktok.com/v/{video_id}"
         
-        headers = {
-            "User-Agent": get_random_user_agent(),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1"
-        }
+        headers = get_random_request_headers()
         
         logger.info(f"Fetching mobile TikTok page: {mobile_url}")
-        response = requests.get(mobile_url, headers=headers, timeout=20)
+        response = requests.get(
+            mobile_url, 
+            headers=headers, 
+            timeout=20,
+            proxies=PROXIES
+        )
         
         if response.status_code != 200:
             logger.error(f"Failed to fetch mobile TikTok page. Status: {response.status_code}")
@@ -141,17 +275,19 @@ def download_tiktok_video_mobile(video_id):
             return None
         
         # Download the video
-        video_headers = {
-            "User-Agent": get_random_user_agent(),
-            "Referer": mobile_url,
+        video_headers = get_random_request_headers(referer=mobile_url)
+        video_headers.update({
             "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Range": "bytes=0-",
-            "DNT": "1",
-            "Connection": "keep-alive"
-        }
+            "Range": "bytes=0-"
+        })
         
-        video_response = requests.get(video_url, headers=video_headers, stream=True, timeout=30)
+        video_response = requests.get(
+            video_url, 
+            headers=video_headers, 
+            stream=True, 
+            timeout=30,
+            proxies=PROXIES
+        )
         
         if video_response.status_code not in [200, 206]:
             logger.error(f"Failed to download video. Status: {video_response.status_code}")
@@ -188,16 +324,18 @@ def download_tiktok_video_web(video_id):
         # Build the web URL
         web_url = f"https://www.tiktok.com/api/item/detail/?itemId={video_id}"
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Referer": f"https://www.tiktok.com/video/{video_id}",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cookie": "tt_csrf_token=xxxx; tt_webid=xxxx"
-        }
+        headers = get_random_request_headers(referer=f"https://www.tiktok.com/video/{video_id}")
+        headers.update({
+            "Accept": "application/json, text/plain, */*"
+        })
         
         logger.info(f"Fetching TikTok web API: {web_url}")
-        response = requests.get(web_url, headers=headers, timeout=20)
+        response = requests.get(
+            web_url, 
+            headers=headers, 
+            timeout=20,
+            proxies=PROXIES
+        )
         
         if response.status_code != 200:
             logger.error(f"Failed to fetch TikTok web API. Status: {response.status_code}")
@@ -219,14 +357,18 @@ def download_tiktok_video_web(video_id):
                     return None
                 
                 # Download the video
-                video_headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                    "Referer": f"https://www.tiktok.com/video/{video_id}",
-                    "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5",
-                    "Accept-Language": "en-US,en;q=0.9"
-                }
+                video_headers = get_random_request_headers(referer=f"https://www.tiktok.com/video/{video_id}")
+                video_headers.update({
+                    "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5"
+                })
                 
-                video_response = requests.get(video_url, headers=video_headers, stream=True, timeout=30)
+                video_response = requests.get(
+                    video_url, 
+                    headers=video_headers, 
+                    stream=True, 
+                    timeout=30,
+                    proxies=PROXIES
+                )
                 
                 if video_response.status_code != 200:
                     logger.error(f"Failed to download video from API. Status: {video_response.status_code}")
@@ -266,14 +408,15 @@ def download_tiktok_video_embed(video_id):
         # Build the embed URL
         embed_url = f"https://www.tiktok.com/embed/v2/{video_id}"
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5"
-        }
+        headers = get_random_request_headers()
         
         logger.info(f"Fetching TikTok embed page: {embed_url}")
-        response = requests.get(embed_url, headers=headers, timeout=20)
+        response = requests.get(
+            embed_url, 
+            headers=headers, 
+            timeout=20,
+            proxies=PROXIES
+        )
         
         if response.status_code != 200:
             logger.error(f"Failed to fetch TikTok embed page. Status: {response.status_code}")
@@ -301,14 +444,18 @@ def download_tiktok_video_embed(video_id):
             return None
         
         # Download the video
-        video_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Referer": embed_url,
-            "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5",
-            "Accept-Language": "en-US,en;q=0.5"
-        }
+        video_headers = get_random_request_headers(referer=embed_url)
+        video_headers.update({
+            "Accept": "video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5"
+        })
         
-        video_response = requests.get(video_url, headers=video_headers, stream=True, timeout=30)
+        video_response = requests.get(
+            video_url, 
+            headers=video_headers, 
+            stream=True, 
+            timeout=30,
+            proxies=PROXIES
+        )
         
         if video_response.status_code != 200:
             logger.error(f"Failed to download video from embed. Status: {video_response.status_code}")
@@ -334,27 +481,166 @@ def download_tiktok_video_embed(video_id):
         logger.error(f"Error in embed method: {e}")
         return None
 
-def convert_video_to_mp3(video_path, video_id):
-    """Convert video to MP3 using ffmpeg."""
+@lru_cache(maxsize=CACHE_SIZE)
+def download_tiktok_video_scraper(video_id):
+    """Try downloading using a more sophisticated approach."""
     try:
-        mp3_path = os.path.join(TEMP_DIR, f"{video_id}.mp3")
+        # Build the direct video URL
+        url = f"https://www.tiktok.com/@tiktok/video/{video_id}"
+        headers = get_random_request_headers()
         
-        # -y: Overwrite output file without asking
-        # -i: Input file
-        # -q:a 2: Audio quality (0-9, 0 = best, 9 = worst)
-        # -map a: Only extract audio stream
-        # -vn: No video
+        # Add specific headers that may help bypass restrictions
+        headers.update({
+            "sec-ch-ua": '"Chromium";v="118", "Google Chrome";v="118"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1"
+        })
+        
+        logger.info(f"Fetching TikTok page with scraper method: {url}")
+        response = requests.get(
+            url, 
+            headers=headers, 
+            timeout=30,
+            proxies=PROXIES
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to fetch TikTok page. Status: {response.status_code}")
+            return None
+            
+        # Try to find the video data in the page
+        # Look for the __UNIVERSAL_DATA_FOR_REHYDRATION__ script
+        universal_data_match = re.search(r'window\["UNIVERSAL_DATA_FOR_REHYDRATION"\]\s*=\s*({.+?});', response.text)
+        if universal_data_match:
+            try:
+                universal_data_str = universal_data_match.group(1)
+                universal_data = json.loads(universal_data_str)
+                
+                # Navigate through the structure to find video URL
+                if "state" in universal_data and "ItemModule" in universal_data["state"]:
+                    item_module = universal_data["state"]["ItemModule"]
+                    if video_id in item_module:
+                        video_data = item_module[video_id]["video"]
+                        video_url = video_data.get("playAddr") or video_data.get("downloadAddr")
+                        
+                        if video_url:
+                            logger.info(f"Found video URL via universal data: {video_url[:60]}...")
+                            
+                            # Download the video
+                            video_headers = get_random_request_headers(referer=url)
+                            video_response = requests.get(
+                                video_url, 
+                                headers=video_headers, 
+                                stream=True, 
+                                timeout=30,
+                                proxies=PROXIES
+                            )
+                            
+                            if video_response.status_code != 200:
+                                logger.error(f"Failed to download video. Status: {video_response.status_code}")
+                                return None
+                            
+                            # Create a temporary file
+                            temp_file = os.path.join(TEMP_DIR, f"{video_id}.mp4")
+                            
+                            # Stream the video to the file
+                            with open(temp_file, 'wb') as f:
+                                for chunk in video_response.iter_content(chunk_size=8192):
+                                    if chunk:
+                                        f.write(chunk)
+                            
+                            if os.path.getsize(temp_file) < 10000:
+                                logger.error(f"Downloaded file is too small: {os.path.getsize(temp_file)} bytes")
+                                os.remove(temp_file)
+                                return None
+                                
+                            return temp_file
+            except json.JSONDecodeError:
+                logger.error("Failed to parse universal data JSON")
+        
+        # If we reached here, try regex method as fallback
+        patterns = [
+            r'"playAddr":"([^"]+)"',
+            r'"downloadAddr":"([^"]+)"',
+            r'"playUrl":"([^"]+)"',
+            r'"contentUrl":"([^"]+)"',
+            r'<video[^>]+src="([^"]+)"'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, response.text)
+            if matches:
+                video_url = matches[0]
+                video_url = video_url.replace('\\u002F', '/').replace('\\', '')
+                logger.info(f"Found video URL via regex: {video_url[:60]}...")
+                
+                # Download the video
+                video_headers = get_random_request_headers(referer=url)
+                video_response = requests.get(
+                    video_url, 
+                    headers=video_headers, 
+                    stream=True, 
+                    timeout=30,
+                    proxies=PROXIES
+                )
+                
+                if video_response.status_code != 200:
+                    logger.error(f"Failed to download video. Status: {video_response.status_code}")
+                    continue
+                
+                # Create a temporary file
+                temp_file = os.path.join(TEMP_DIR, f"{video_id}.mp4")
+                
+                # Stream the video to the file
+                with open(temp_file, 'wb') as f:
+                    for chunk in video_response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                if os.path.getsize(temp_file) < 10000:
+                    logger.error(f"Downloaded file is too small: {os.path.getsize(temp_file)} bytes")
+                    os.remove(temp_file)
+                    continue
+                    
+                return temp_file
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error in scraper method: {e}")
+        return None
+
+def convert_video_to_mp3(video_path, video_id, quality="192"):
+    """Convert video to MP3 using ffmpeg with specified quality."""
+    try:
+        # Map quality string to bitrate
+        quality_bitrates = {
+            "128": "128k",
+            "192": "192k",
+            "256": "256k",
+            "320": "320k"
+        }
+        
+        bitrate = quality_bitrates.get(quality, "192k")
+        mp3_path = os.path.join(TEMP_DIR, f"{video_id}_{quality}.mp3")
+        
+        # FFmpeg command with improved audio quality options
         cmd = [
             'ffmpeg',
-            '-y',
-            '-i', video_path,
-            '-q:a', '2',
-            '-map', 'a',
-            '-vn',
+            '-y',  # Overwrite output file without asking
+            '-i', video_path,  # Input file
+            '-vn',  # No video
+            '-ar', '44100',  # Audio sample rate: 44.1kHz
+            '-ac', '2',  # Audio channels: stereo
+            '-b:a', bitrate,  # Audio bitrate
+            '-f', 'mp3',  # Force format
             mp3_path
         ]
         
-        logger.info(f"Converting video to MP3: {' '.join(cmd)}")
+        logger.info(f"Converting video to MP3 at {bitrate} quality")
         process = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
         
         if process.returncode != 0:
@@ -367,7 +653,7 @@ def convert_video_to_mp3(video_path, video_id):
         logger.error(f"Error converting video to MP3: {e}")
         return None
 
-def get_tiktok_video(url):
+def get_tiktok_video(url, quality="192"):
     """Try multiple methods to download TikTok video."""
     # Extract video ID from URL
     video_id = extract_video_id(url)
@@ -377,196 +663,267 @@ def get_tiktok_video(url):
     
     logger.info(f"Extracted video ID: {video_id}")
     
-    # Check if we already have the MP3 cached
-    mp3_path = os.path.join(TEMP_DIR, f"{video_id}.mp3")
+    # Check if we already have the MP3 cached at the requested quality
+    mp3_path = os.path.join(TEMP_DIR, f"{video_id}_{quality}.mp3")
     if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
         logger.info(f"Using cached MP3 file: {mp3_path}")
         return mp3_path, video_id
     
-    # List of methods to try in order
-    methods = [
-        download_tiktok_video_mobile,
-        download_tiktok_video_web,
-        download_tiktok_video_embed
-    ]
-    
-    for method in methods:
-        try:
-            logger.info(f"Trying download method: {method.__name__}")
-            video_path = method(video_id)
-            
-            if video_path:
-                logger.info(f"Successfully downloaded video using {method.__name__}")
-                
-                # Convert video to MP3
-                mp3_path = convert_video_to_mp3(video_path, video_id)
-                if mp3_path:
+    # Check if this download is already in progress
+    with active_downloads_lock:
+        if video_id in active_downloads:
+            # Wait for a bit and check if it's completed
+            logger.info(f"Download already in progress for video ID: {video_id}, waiting...")
+            for _ in range(10):  # Wait for max 5 seconds
+                time.sleep(0.5)
+                if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                    logger.info(f"Downloaded file is now available: {mp3_path}")
                     return mp3_path, video_id
-                    
-            # Wait a moment before trying the next method to avoid rate limiting
-            time.sleep(1)
-        except Exception as e:
-            logger.error(f"Error in download method {method.__name__}: {e}")
-    
-    logger.error("All download methods failed")
-    return None, video_id
-
-def cleanup_old_files():
-    """Clean up old temporary files to prevent disk space issues."""
-    try:
-        current_time = time.time()
-        for filename in os.listdir(TEMP_DIR):
-            file_path = os.path.join(TEMP_DIR, filename)
-            # Remove files older than cache expiration time
-            if os.path.isfile(file_path) and current_time - os.path.getmtime(file_path) > CACHE_EXPIRATION:
-                os.remove(file_path)
-                logger.info(f"Removed old file: {filename}")
-    except Exception as e:
-        logger.error(f"Error cleaning up old files: {e}")
-
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint to verify service is running."""
-    return jsonify({"status": "ok", "message": "TikTok to MP3 converter service is running"})
-
-@app.route('/api/convert', methods=['POST'])
-def convert_tiktok_to_mp3():
-    """API endpoint to download TikTok videos and convert to MP3."""
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "Invalid JSON data"}), 400
             
-        url = data.get('url')
+            # If still not available, consider it a new request
+            logger.info(f"Timed out waiting for active download, proceeding with new request")
         
-        if not url:
-            return jsonify({"error": "No URL provided"}), 400
+        # Mark this download as in progress
+        active_downloads[video_id] = True
+    
+    try:
+        # List of methods to try in order
+        methods = [
+            download_tiktok_video_mobile,
+            download_tiktok_video_scraper,  # Added new method
+            download_tiktok_video_web,
+            download_tiktok_video_embed
+        ]
         
-        if not is_valid_tiktok_url(url):
-            return jsonify({"error": "Invalid TikTok URL"}), 400
+        video_path = None
+        for method in methods:
+            try:
+                logger.info(f"Trying download method: {method.__name__}")
+                video_path = method(video_id)
+                
+                if video_path:
+                    logger.info(f"Successfully downloaded video using {method.__name__}")
+                    
+                   # Convert video to MP3 with specified quality
+                    mp3_path = convert_video_to_mp3(video_path, video_id, quality)
+                    
+                    if mp3_path:
+                        logger.info(f"Successfully converted video to MP3: {mp3_path}")
+                        return mp3_path, video_id
+                    else:
+                        logger.error("Failed to convert video to MP3")
+                        
+                except Exception as e:
+                    logger.error(f"Error in method {method.__name__}: {e}")
         
-        # Clean up old files occasionally to prevent disk space issues
-        if random.random() < 0.1:  # 10% chance to trigger cleanup
-            cleanup_old_files()
+        # If we get here, all methods failed
+        logger.error(f"All download methods failed for video ID: {video_id}")
+        return None, video_id
+    finally:
+        # Remove the download from active downloads
+        with active_downloads_lock:
+            if video_id in active_downloads:
+                del active_downloads[video_id]
+
+def check_cache_size():
+    """Check if cache size exceeds limit and clean up if necessary."""
+    try:
+        # Get total size of temp directory
+        total_size = sum(os.path.getsize(os.path.join(TEMP_DIR, f)) for f in os.listdir(TEMP_DIR) if os.path.isfile(os.path.join(TEMP_DIR, f)))
+        total_size_mb = total_size / (1024 * 1024)
         
-        # Try to download the video and convert to MP3
-        mp3_path, video_id = get_tiktok_video(url)
+        if total_size_mb > MAX_CACHE_SIZE_MB:
+            logger.info(f"Cache size exceeds limit ({total_size_mb:.2f}MB > {MAX_CACHE_SIZE_MB}MB). Cleaning up...")
+            
+            # Get list of files with their modification times
+            files = [(f, os.path.getmtime(os.path.join(TEMP_DIR, f))) 
+                    for f in os.listdir(TEMP_DIR) 
+                    if os.path.isfile(os.path.join(TEMP_DIR, f))]
+            
+            # Sort by modification time (oldest first)
+            files.sort(key=lambda x: x[1])
+            
+            # Delete files until we're under 80% of the limit
+            while total_size_mb > (MAX_CACHE_SIZE_MB * 0.8) and files:
+                file_to_delete, _ = files.pop(0)
+                file_path = os.path.join(TEMP_DIR, file_to_delete)
+                file_size = os.path.getsize(file_path) / (1024 * 1024)
+                
+                logger.info(f"Deleting {file_to_delete} ({file_size:.2f}MB)")
+                os.remove(file_path)
+                
+                total_size_mb -= file_size
+    except Exception as e:
+        logger.error(f"Error checking cache size: {e}")
+
+# Start a background thread to periodically clean the cache
+def cache_cleaner():
+    """Background thread to periodically clean the cache."""
+    while True:
+        try:
+            check_cache_size()
+        except Exception as e:
+            logger.error(f"Error in cache cleaner: {e}")
+        
+        # Sleep for 1 hour
+        time.sleep(3600)
+
+# Start the cache cleaner thread
+cache_thread = threading.Thread(target=cache_cleaner, daemon=True)
+cache_thread.start()
+
+@app.route('/api/download', methods=['POST'])
+def download_tiktok():
+    """Endpoint to download TikTok videos and convert to MP3."""
+    if not can_perform_download():
+        return jsonify({
+            "error": "Rate limit exceeded. Please try again later."
+        }), 429
+    
+    # Get request data
+    data = request.get_json()
+    
+    # Check for required fields
+    if not data or 'url' not in data:
+        return jsonify({
+            "error": "Missing required field: url"
+        }), 400
+    
+    url = data['url']
+    quality = data.get('quality', '192')  # Default to 192kbps if not specified
+    turnstile_token = data.get('turnstileToken')
+    
+    # Verify Turnstile token if provided
+    if turnstile_token:
+        success, errors = verify_turnstile_token(turnstile_token, request.remote_addr)
+        if not success:
+            return jsonify({
+                "error": "Invalid turnstile token",
+                "details": errors
+            }), 403
+    
+    # Validate URL
+    if not is_valid_tiktok_url(url):
+        return jsonify({
+            "error": "Invalid TikTok URL"
+        }), 400
+    
+    # Track download attempt
+    stats.increment_total()
+    
+    try:
+        # Get video and convert to MP3
+        mp3_path, video_id = get_tiktok_video(url, quality)
         
         if not mp3_path:
-            return jsonify({"error": "Failed to download and convert video"}), 500
-            
-        # Set appropriate headers for download
+            stats.increment_failed()
+            return jsonify({
+                "error": "Failed to download or convert video"
+            }), 500
+        
+        # Generate download token
+        download_token = hashlib.md5(f"{video_id}_{quality}_{int(time.time())}".encode()).hexdigest()
+        
+        # Store token for later verification
+        app.config.setdefault('DOWNLOAD_TOKENS', {})[download_token] = {
+            'path': mp3_path,
+            'video_id': video_id,
+            'expires': time.time() + 3600  # Token expires in 1 hour
+        }
+        
+        stats.increment_success()
+        
+        return jsonify({
+            "success": True,
+            "token": download_token,
+            "video_id": video_id
+        })
+        
+    except Exception as e:
+        logger.error(f"Error processing download request: {e}")
+        stats.increment_failed()
+        return jsonify({
+            "error": "Failed to process request",
+            "details": str(e)
+        }), 500
+
+@app.route('/api/download/<token>', methods=['GET'])
+def get_download(token):
+    """Endpoint to retrieve the converted MP3 file using a token."""
+    # Verify token
+    download_tokens = app.config.get('DOWNLOAD_TOKENS', {})
+    if token not in download_tokens:
+        return jsonify({
+            "error": "Invalid or expired download token"
+        }), 404
+    
+    # Get download info
+    download_info = download_tokens[token]
+    
+    # Check if token is expired
+    if download_info['expires'] < time.time():
+        # Remove expired token
+        del download_tokens[token]
+        return jsonify({
+            "error": "Download token expired"
+        }), 410
+    
+    # Check if file exists
+    mp3_path = download_info['path']
+    if not os.path.exists(mp3_path):
+        return jsonify({
+            "error": "File not found"
+        }), 404
+    
+    # Get TikTok video ID for filename
+    video_id = download_info['video_id']
+    
+    try:
+        # Send the file
         return send_file(
-            mp3_path, 
-            as_attachment=True, 
+            mp3_path,
+            as_attachment=True,
             download_name=f"tiktok_{video_id}.mp3",
             mimetype="audio/mpeg"
         )
-        
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+        logger.error(f"Error sending file: {e}")
+        return jsonify({
+            "error": "Failed to send file",
+            "details": str(e)
+        }), 500
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    """API endpoint to get service statistics."""
-    try:
-        cache_files = len([f for f in os.listdir(TEMP_DIR) if os.path.isfile(os.path.join(TEMP_DIR, f))])
-        mp3_files = len([f for f in os.listdir(TEMP_DIR) if f.endswith('.mp3')])
-        mp4_files = len([f for f in os.listdir(TEMP_DIR) if f.endswith('.mp4')])
-        
-        return jsonify({
-            "status": "ok",
-            "stats": {
-                "cache_files": cache_files,
-                "mp3_files": mp3_files,
-                "mp4_files": mp4_files,
-                "cache_dir_size_mb": sum(os.path.getsize(os.path.join(TEMP_DIR, f)) for f in os.listdir(TEMP_DIR) if os.path.isfile(os.path.join(TEMP_DIR, f))) / (1024 * 1024)
-            }
-        })
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        return jsonify({"error": f"Error getting stats: {str(e)}"}), 500
+    """Endpoint to get download statistics."""
+    return jsonify(stats.get_stats())
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Endpoint for health checks."""
+    return jsonify({
+        "status": "ok",
+        "cache_size_mb": sum(os.path.getsize(os.path.join(TEMP_DIR, f)) for f in os.listdir(TEMP_DIR) if os.path.isfile(os.path.join(TEMP_DIR, f))) / (1024 * 1024),
+        "active_downloads": len(active_downloads),
+        "uptime": int(time.time() - app.config.get('START_TIME', time.time()))
+    })
+
+# Set start time when the app initializes
+app.config['START_TIME'] = time.time()
+
+# Cleanup function to run periodically
+@app.before_first_request
+def initialize():
+    """Initialize the application."""
+    # Clean up old files at startup
+    check_cache_size()
 
 if __name__ == '__main__':
-    # Create a README file for Render deployment
-    readme_path = 'README.md'
-    with open(readme_path, 'w') as f:
-        f.write("""# TikTok to MP3 Converter API
-
-A Flask-based API service that downloads TikTok videos and converts them to MP3 format.
-
-## Requirements
-- Python 3.8+
-- FFmpeg must be installed on the system
-
-## Environment Variables
-None required
-
-## API Endpoints
-- POST /api/convert: Convert TikTok video to MP3
-- GET /api/health: Health check endpoint
-- GET /api/stats: Get service statistics
-
-## Deployment
-This service is designed to be deployed on Render.com.
-
-### Render.com Setup
-1. Create a new Web Service
-2. Use the Docker Runtime
-3. No environment variables needed
-4. Make sure to install FFmpeg in your build script
-""")
-
-    # Create a Dockerfile for Render deployment
-    dockerfile_path = 'Dockerfile'
-    with open(dockerfile_path, 'w') as f:
-        f.write("""FROM python:3.9-slim
-
-WORKDIR /app
-
-# Install FFmpeg and other dependencies
-RUN apt-get update && \
-    apt-get install -y ffmpeg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
-COPY . .
-
-# Expose port
-EXPOSE 8080
-
-# Command to run the application
-CMD gunicorn --bind 0.0.0.0:8080 app:app
-""")
-
-    # Create requirements.txt for dependencies
-    requirements_path = 'requirements.txt'
-    with open(requirements_path, 'w') as f:
-        f.write("""flask==2.0.1
-flask-cors==3.0.10
-requests==2.26.0
-gunicorn==20.1.0
-""")
-
-    print("TikTok to MP3 Converter API Server")
-    print("----------------------------")
-    print("API Endpoints:")
-    print("  - POST /api/convert: Convert TikTok videos to MP3")
-    print("  - GET /api/health: Health check endpoint")
-    print("  - GET /api/stats: Get service statistics")
-    print("\nServer is starting on http://0.0.0.0:8080\n")
+    # Create temp directory if it doesn't exist
+    os.makedirs(TEMP_DIR, exist_ok=True)
     
-    # Run the Flask app with gunicorn configuration for production
-    port = int(os.environ.get("PORT", 8080))
-    app.run(
-        host='0.0.0.0',  # Allow external connections for production
-        port=port,
-        debug=False,
-        threaded=True
-    )
+    # Log startup information
+    logger.info(f"Starting TikTok to MP3 Converter API. Temp directory: {TEMP_DIR}")
+    
+    # Run the Flask app
+    app.run(host='0.0.0.0', port=5000, debug=False)
